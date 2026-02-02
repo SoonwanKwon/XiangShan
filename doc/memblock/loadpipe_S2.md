@@ -193,6 +193,13 @@ S2 forwarding logic addresses these hazards:
 - **Memory ambiguity** (store-set hit): `s2_mem_amb` set when store-set indicates hazard and addr is not ready.
 - **Mis-match between vaddr/paddr CAMs**: `matchInvalid` flags cause flush/replay in later stage.
 
+### 3.2.1) Store-Set Predictor (Why `storeSetHit` Exists)
+`storeSetHit` is **not** a cache hit. It comes from the **store-set predictor** (SSIT + LFST/WaitTable) that is trained by **previous memory-violation redirects**. When a load is tagged with `storeSetHit`, it means the predictor has learned that this load has conflicted with an older store in the past, so S2 treats missing store address as **memory ambiguity**:
+
+- **Prediction source**: SSIT / WaitTable (`StoreSet.scala`, `WaitTable.scala`)
+- **Training event**: memory-violation redirect (e.g., RAW rollback) via `memPredUpdate` in `CtrlBlock`
+- **Effect in S2**: if `storeSetHit && io.lsq.forward.addrInvalid`, set `s2_mem_amb` → replay cause `C_MA` (slow replay)
+
 ### 3.3) Replay triggers tied to forward path
 | Condition | Signal(s) | Effect |
 |---|---|---|

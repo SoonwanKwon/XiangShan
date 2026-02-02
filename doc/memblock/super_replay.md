@@ -715,3 +715,240 @@ Super replay exemplifies the principle that **timing is correctness** in high-pe
 - MemBlock overview: `doc/memblock/memblock_1.md`
 - Load replay queue: (to be documented)
 - TileLink protocol: See Rocket Chip documentation
+
+---
+
+## Super Replay Sequences (Major Conditions)
+
+Below are the major super replay sequences observed in the RTL. These cover all common timing and control conditions around `C_DM` replays, L2 hints, and D-channel arrivals.
+
+Legend:
+- **L2 hint**: `io.l2_hint.valid && io.l2_hint.bits.sourceId == missMSHRId`
+- **D-channel**: `io.tl_d_channel.valid && io.tl_d_channel.mshrid == missMSHRId`
+- **SR**: super replay request (`forward_tlDchannel = true`, i.e. C_DM replay)
+
+Timing note:
+- ReplayQueue scheduling is **pipelined** (`s0_oldestSel` → `s1_oldestSel` → `s2_oldestSel`), so a selection made in **RQ s0** appears on `io.replay` about **2 cycles later**.
+- LoadUnit then needs **S0 → S1 → S2**; MSHR/D-channel forward results are **registered**, so forwarded data is observed **one cycle after** the request (i.e. in S2 for a request issued in S1).
+
+Compact timing diagram (one replay entry, ideal flow):
+```
+Cycle:    N        N+1        N+2        N+3        N+4
+RQ:     s0_sel -> s1_sel -> s2_sel -> (hold) -> (hold)
+                  |           |
+                  |           +-> io.replay.valid (forward_tlDchannel=1)
+LU:                         S0 issue -> S1 query -> S2 fwd -> S3 wb
+Signals:                    io.replay.fire
+                             s1_out.forward_tlDchannel
+                             io.forward_mshr.valid / io.tl_d_channel.valid
+                             s2_fwd_frm_d_chan_or_mshr
+```
+Mermaid version:
+```mermaid
+sequenceDiagram
+  participant L2 as L2 hint
+  participant RQ as ReplayQueue
+  participant LU as LoadUnit
+  participant D as D-channel
+  participant M as MSHR
+  Note over RQ: Cycle N: RQ s0 selects entry
+  Note over RQ: Cycle N+1: RQ s1 registers selection
+  RQ->>LU: Cycle N+2: io.replay.valid (forward_tlDchannel=1)
+  LU->>M: Cycle N+3: io.forward_mshr.valid
+  D-->>LU: Cycle N+3: D-channel forward match
+  LU->>LU: Cycle N+4: s2_fwd_frm_d_chan_or_mshr=1
+```
+
+### A) Ideal Case: Hint Early + Data in First Beat (Same-Cycle Selection)
+```
+Cycle N:   L2 hint arrives (match) -> s0_loadHintWakeMask=1
+           dataInLastBeatReg=0 -> s0_loadHintSelMask=1
+           blocking stays true in this cycle but hint-sel bypasses it
+Cycle N:   RQ s0 selects entry via hint path
+           (uses s0_loadHintSelMask, ignores blocking)
+Cycle N+1: RQ s1 registers selection (scheduled set)
+Cycle N+2: RQ s2 drives io.replay.valid, forward_tlDchannel=1
+           io.replay.fire if s0_can_go && io.dcache.req.ready
+Cycle N+3: LU S1 asserts io.forward_mshr.valid
+           io.tl_d_channel.forward(...) can match beat0
+Cycle N+4: LU S2 sees s2_fwd_frm_d_chan_or_mshr=1, no cache read
+```
+**Why it works**: the hint-based select path bypasses the old `blocking` value in the same cycle, so the load enters S0 early enough to catch beat0.
+Mermaid:
+```mermaid
+sequenceDiagram
+  participant L2 as L2 hint
+  participant RQ as ReplayQueue
+  participant LU as LoadUnit
+  participant D as D-channel
+  participant M as MSHR
+  Note over L2,RQ: Cycle N: hint match, s0_loadHintSelMask=1
+  Note over RQ: Cycle N: RQ s0 selects via hint path
+  Note over RQ: Cycle N+1: RQ s1 registers selection
+  RQ->>LU: Cycle N+2: io.replay.valid, forward_tlDchannel=1
+  LU->>M: Cycle N+3: io.forward_mshr.valid
+  D-->>LU: Cycle N+3: forward beat0
+  LU->>LU: Cycle N+4: s2_fwd_frm_d_chan_or_mshr=1
+```
+
+### B) Hint Early + Data in Last Beat (One-Cycle Delay)
+```
+Cycle N:   L2 hint arrives (match) -> s0_loadHintWakeMask=1
+           dataInLastBeatReg=1 -> s0_loadHintSelMask=0
+           blocking will be cleared (registered) after this cycle
+Cycle N+1: RQ s0 selects via normal C_DM path (blocking=false)
+           (uses s0_loadHigherPriorityReplaySelMask)
+Cycle N+2: RQ s1 registers selection
+Cycle N+3: RQ s2 drives io.replay.valid, forward_tlDchannel=1
+           io.replay.fire if s0_can_go && io.dcache.req.ready
+Cycle N+4: LU S1 asserts io.forward_mshr.valid
+           io.tl_d_channel.forward(...) matches beat1
+Cycle N+5: LU S2 sees s2_fwd_frm_d_chan_or_mshr=1, no cache read
+```
+**Why it works**: hint wakes the entry, but selection is delayed one cycle to align with the second beat.
+Mermaid:
+```mermaid
+sequenceDiagram
+  participant L2 as L2 hint
+  participant RQ as ReplayQueue
+  participant LU as LoadUnit
+  participant D as D-channel
+  participant M as MSHR
+  Note over L2,RQ: Cycle N: hint match, last beat -> no hint select
+  Note over RQ: Cycle N+1: RQ s0 selects via C_DM path
+  Note over RQ: Cycle N+2: RQ s1 registers selection
+  RQ->>LU: Cycle N+3: io.replay.valid, forward_tlDchannel=1
+  LU->>M: Cycle N+4: io.forward_mshr.valid
+  D-->>LU: Cycle N+4: forward beat1
+  LU->>LU: Cycle N+5: s2_fwd_frm_d_chan_or_mshr=1
+```
+
+### C) No Hint: Reactive Unblock on D-Channel Arrival
+```
+Cycle N:   D-channel arrives (match) -> blocking cleared reactively
+Cycle N+1: RQ s0 selects via C_DM path (blocking cleared by D-channel)
+Cycle N+2: RQ s1 registers selection
+Cycle N+3: RQ s2 drives io.replay.valid, forward_tlDchannel=1
+           io.replay.fire if s0_can_go && io.dcache.req.ready
+Cycle N+4: LU S1 asserts io.forward_mshr.valid; D-channel already passed
+Cycle N+5: LU S2 may still forward from MSHR (if beat valid remains),
+           otherwise fallback to normal cache read on a later replay
+```
+**Outcome**: the load still replays as C_DM, but may miss the precise forward window and lose some or all of the super replay benefit.
+Mermaid:
+```mermaid
+sequenceDiagram
+  participant RQ as ReplayQueue
+  participant LU as LoadUnit
+  participant D as D-channel
+  participant M as MSHR
+  Note over D,RQ: Cycle N: D-channel match clears blocking
+  Note over RQ: Cycle N+1: RQ s0 selects via C_DM path
+  Note over RQ: Cycle N+2: RQ s1 registers selection
+  RQ->>LU: Cycle N+3: io.replay.valid, forward_tlDchannel=1
+  LU->>M: Cycle N+4: io.forward_mshr.valid (D-channel already passed)
+  LU->>LU: Cycle N+5: forward from MSHR if still valid
+```
+
+### D) Hint Late or Mismatch (Ignored Hint)
+```
+Cycle N:   L2 hint arrives but sourceId mismatch -> no wakeup
+Cycle N+1: D-channel arrives -> blocking cleared reactively
+Cycle N+2: RQ s0 selects via C_DM path (blocking cleared by D-channel)
+Cycle N+3: RQ s1 registers selection
+Cycle N+4: RQ s2 drives io.replay.valid, forward_tlDchannel=1
+           io.replay.fire if s0_can_go && io.dcache.req.ready
+```
+**Outcome**: behaves like the reactive case; hint does not affect scheduling.
+Mermaid:
+```mermaid
+sequenceDiagram
+  participant L2 as L2 hint
+  participant RQ as ReplayQueue
+  participant LU as LoadUnit
+  participant D as D-channel
+  Note over L2,RQ: Cycle N: hint mismatch -> ignored
+  Note over D,RQ: Cycle N+1: D-channel match clears blocking
+  Note over RQ: Cycle N+2: RQ s0 selects via C_DM path
+  Note over RQ: Cycle N+3: RQ s1 registers selection
+  RQ->>LU: Cycle N+4: io.replay.valid, forward_tlDchannel=1
+```
+
+### E) Multiple Loads Waiting on the Same MSHR
+```
+Cycle N:   L2 hint arrives (match for multiple entries)
+           All matching entries: blocking cleared
+Cycle N:   Oldest (per port) chosen by hint-priority selection
+Cycle N+1+: Remaining entries are selected in subsequent cycles
+```
+**Key detail**: selection uses oldest/age logic per port; only one entry per port issues per cycle, others stay unblocked and wait.
+Mermaid:
+```mermaid
+sequenceDiagram
+  participant L2 as L2 hint
+  participant RQ as ReplayQueue
+  participant LU as LoadUnit
+  Note over L2,RQ: Cycle N: hint matches multiple entries
+  Note over RQ: Cycle N: RQ s0 selects oldest per port
+  RQ->>LU: Cycle N+2: io.replay.valid (oldest entry)
+  Note over RQ: Cycle N+1+: other entries remain unblocked and are selected later
+```
+
+### F) Redirect / Flush While Waiting
+```
+Cycle N:   Entry is allocated and blocked (waiting for hint or D-channel)
+Cycle N+1: Redirect/flush triggers needCancel -> entry freed
+Cycle N+2: Later hint or D-channel for that MSHR is ignored (no entry)
+```
+**Outcome**: super replay is abandoned safely; correctness handled by normal redirect logic.
+Mermaid:
+```mermaid
+sequenceDiagram
+  participant RQ as ReplayQueue
+  participant LU as LoadUnit
+  participant L2 as L2 hint
+  Note over RQ: Cycle N: entry allocated + blocking=true
+  RQ-->>LU: Cycle N+1: redirect/flush cancels entry (needCancel)
+  Note over L2,RQ: Cycle N+2: hint/D-channel ignored (no entry)
+```
+
+### G) Data Already Available at Enqueue (full_fwd / D-channel same cycle)
+```
+Cycle N:   Replay enqueued with C_DM
+           blocking set to false because:
+             - replayInfo.full_fwd = 1, or
+             - D-channel already valid this cycle
+Cycle N+1: RQ s0 can select immediately (no hint needed)
+```
+**Outcome**: behaves like a super replay with zero wait; the entry is ready as soon as it appears in the queue.
+Mermaid:
+```mermaid
+sequenceDiagram
+  participant RQ as ReplayQueue
+  participant LU as LoadUnit
+  participant D as D-channel
+  Note over RQ: Cycle N: enqueue C_DM, blocking=false
+  Note over D,RQ: Cycle N: D-channel already valid or full_fwd=1
+  Note over RQ: Cycle N+1: RQ s0 selects immediately
+  RQ->>LU: Cycle N+2: io.replay.valid (forward_tlDchannel=1)
+```
+
+### H) LoadUnit Backpressure (S0 Cannot Accept Replay)
+```
+Cycle N:   RQ s2 drives io.replay (SR valid)
+           but io.dcache.req.ready=0 or s0_can_go=0
+           -> io.replay.ready=0, replay does not fire
+Cycle N+1+: RQ holds s2_oldestSel valid until ready
+           SR is delayed, may miss D-channel forward window
+```
+**Outcome**: SR is still highest priority, but backpressure can delay S0 and degrade to a normal cache read if the forward window is missed.
+Mermaid:
+```mermaid
+sequenceDiagram
+  participant RQ as ReplayQueue
+  participant LU as LoadUnit
+  Note over RQ: Cycle N: io.replay.valid=1
+  Note over LU: Cycle N: io.dcache.req.ready=0 or s0_can_go=0
+  RQ-->>LU: Cycle N: io.replay.fire=0 (ready low)
+  Note over RQ: Cycle N+1+: s2_oldestSel held until ready
+```

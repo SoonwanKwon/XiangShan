@@ -124,6 +124,54 @@ Load A reads vaddr 0x1000
 - TLB mapping changed between load's translation and store's translation
 - Alias problem: Two virtual addresses map to different physical addresses
 
+**Sequence Diagrams (CAM mismatch root causes)**:
+
+1) **Store address arrives after load queried forwarding**
+   **When this happens**: The load’s address/translation is ready early, but the older store’s address or translation is late (addr calc not ready, TLB miss, etc.). The load queries forwarding before the store has a stable paddr, so the later store resolution can invalidate the earlier forward.
+```mermaid
+sequenceDiagram
+  participant L as Load (S1/S2/S3)
+  participant LSQ as LSQ Forward
+  participant S as Store Pipe
+
+  L->>LSQ: S1 forward query (vaddr, paddr from load TLB)
+  LSQ-->>L: S2 forward data (matched on partial/early info)
+  S->>LSQ: Store addr becomes valid (same vaddr, different paddr)
+  LSQ-->>L: S3 CAM re-check -> matchInvalid=1
+  L->>L: Redirect (flush)
+```
+
+2) **TLB mapping changed between load and store**
+   **When this happens**: The load translates vaddr to paddr P1, but by the time the older store translates, the mapping yields P2 (e.g., mapping update/flush or alias/homonym). The forward decision based on P1 becomes invalid.
+```mermaid
+sequenceDiagram
+  participant L as Load
+  participant T as DTLB
+  participant LSQ as LSQ Forward
+  participant S as Store
+
+  L->>T: Translate vaddr -> paddr=P1
+  L->>LSQ: S1 forward query (vaddr, paddr=P1)
+  S->>T: Translate vaddr -> paddr=P2 (mapping changed)
+  LSQ-->>L: S2 forward data based on earlier query
+  LSQ-->>L: S3 CAM re-check sees P1 != P2 -> matchInvalid
+  L->>L: Redirect (flush)
+```
+
+3) **Alias / homonym: same vaddr, different paddr**
+```mermaid
+sequenceDiagram
+  participant L as Load
+  participant LSQ as LSQ Forward
+  participant S as Store
+
+  L->>LSQ: Query by vaddr (matches store entry)
+  LSQ-->>L: Forwarded data
+  S->>LSQ: Store paddr resolves (paddr != load paddr)
+  LSQ-->>L: CAM re-check detects vaddr/paddr mismatch
+  L->>L: Redirect (flush)
+```
+
 **Code Implementation** (LoadUnit.scala:1040-1041):
 ```scala
 // S3: Check for vaddr/paddr mismatch from LSQ/Sbuffer forwarding
@@ -714,6 +762,38 @@ sequenceDiagram
 
 ## Debug and Troubleshooting
 
+---
+
+## Load-Load Violation Query Target (S2)
+
+At **S2**, the load pipeline sends `ldld_nuke_query` to the **LoadQueueRAR** (RAR queue) inside the LSQ (`LoadQueue.scala`). This is a load‑load ordering check against **older pending loads** that are still tracked in the RAR structure. The response comes back from LoadQueueRAR and is consumed in **S3** to decide whether a **flushAfter** redirect is needed.
+
+Key wiring:
+- **Requester**: LoadUnit S2
+- **Responder**: `LoadQueueRAR` (RAR queue) in `LoadQueue`
+- **Interface**: `io.lsq.ldld_nuke_query` (req/resp/revoke)
+
+---
+
+## Sequence Diagram: Load-Load (RAR) Violation Query & Redirect
+
+```mermaid
+sequenceDiagram
+  participant LU as LoadUnit
+  participant LSQ as LoadQueue
+  participant RAR as LoadQueueRAR
+  participant ROB as ROB/Redirect
+
+  Note over LU: S2 builds ldld_nuke_query.req (uop, paddr, mask, data_valid)
+  LU->>LSQ: ldld_nuke_query.req
+  LSQ->>RAR: query.req
+  RAR-->>LSQ: query.resp (rep_frm_fetch?)
+  LSQ-->>LU: ldld_nuke_query.resp
+
+  Note over LU: S3 consumes resp, sets s3_flushPipe if violation
+  LU->>ROB: rollback (RedirectLevel.flushAfter)
+  LU->>LSQ: ldld_nuke_query.revoke (on redirect/exception)
+```
 ### Debug Signals
 
 **Redirect Trigger Signals** (LoadUnit.scala):

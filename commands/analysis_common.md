@@ -3,7 +3,11 @@ If there is any memory or data type, it should be clearly shown with its structu
 And, for each data, add enough explanation to understand clearly.
 
 # Common Guide for pipeline diagram
-Draw mermaid diagram with keeping the following styles
+Draw mermaid diagram with keeping the styles described below.
+Provide top diagram showing module, interfance, and pipeline clearly.
+  : You can provide each modules diagram also (Pipeline should be clearly shown.)
+Define working scenarios and explain each with detailed sequence diagram
+
 
 1. Pipeline should be clearly shown including pipeline registers.
 2. Each logic should be clearly shown as pseudo code upon relevant request.
@@ -13,7 +17,8 @@ Draw mermaid diagram with keeping the following styles
 # Draw diagram with mermaid for pipeline, sequence and data structure also
 1. Include possible explanation 
 2. If possible, keep the styling.
-
+3. The shape of memory block (SRAM) should be cylinder
+4. Use "<br>" instead of "\n" since "/n" does not work.
 ```
   %% styling
   classDef memory fill:#e8f5e9,stroke:#1b5e20,stroke-width:1px;

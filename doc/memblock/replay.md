@@ -42,8 +42,8 @@ All replay causes are defined in `LoadReplayCauses` object with fixed priority (
 | C_DM | 4 | dcache_miss | DCache Miss | Real cache miss, requires refill | ❌ No (super replay) |
 | C_WF | 5 | wpu_fail | Way Predictor Fail | Way prediction incorrect | ✅ Yes |
 | C_BC | 6 | bank_conflict | Bank Conflict | DCache bank resource conflict | ✅ Yes |
-| C_RAR | 7 | rar_nack | RAR NACK | Load-load query queue full | ❌ No |
-| C_RAW | 8 | raw_nack | RAW NACK | Store-load query queue full | ❌ No |
+| C_RAR | 7 | rar_nack | RAR NACK | RAR query not accepted (free list cannot allocate → queue full) | ❌ No |
+| C_RAW | 8 | raw_nack | RAW NACK | RAW query not accepted (free list cannot allocate → queue full) | ❌ No |
 | C_NK | 9 | nuke | Nuke | Store-load ordering violation | ✅ Conditional |
 
 **Key insight**: Fast replay is only for **transient, quickly-resolvable** issues. Long-latency dependencies (TLB miss, store data wait, cache miss) use slow replay.
@@ -187,8 +187,8 @@ Any of these causes trigger slow replay (via LSQ):
 | **C_TM** (tlb_miss) | Must wait for page table walk | TLB hint signals refill complete (`io.tlb_hint.resp.valid`) |
 | **C_FF** (fwd_fail) | Must wait for store data to be written | Store data becomes ready (`stDataDeqVec(i)`) |
 | **C_DM** (dcache_miss) | Must wait for L2/memory refill | **Super replay** path (L2 hint + D-channel forward) |
-| **C_RAR** (rar_nack) | RAR queue full, must wait for space | RAR queue has space (`!io.rarFull`) |
-| **C_RAW** (raw_nack) | RAW queue full, must wait for space | RAW queue has space (`!io.rawFull`) |
+| **C_RAR** (rar_nack) | RAR query not accepted (queue full), must wait for space | RAR queue has space (`!io.rarFull`) |
+| **C_RAW** (raw_nack) | RAW query not accepted (queue full), must wait for space | RAW queue has space (`!io.rawFull`) |
 | **C_NK** (nuke) | Store-load violation with other complications | Violation cleared (store committed or load re-executed after flush) |
 
 **Note**: C_DR (dcache_rep), C_BC (bank_conflict), C_WF (wpu_fail) can also go to slow replay if fast replay is canceled.
@@ -568,8 +568,8 @@ The `rep_info` structure (populated in S2, used in S3) contains all replay metad
 | `dcache_miss` | Bool | `s2_dcache_miss` | Real cache miss (requires refill) | Causes C_DM slow replay (super replay path) |
 | `bank_conflict` | Bool | `s2_bank_conflict` | DCache bank busy | Enables fast replay (C_BC) if no miss |
 | `wpu_fail` | Bool | `s2_wpu_pred_fail` | Way prediction incorrect | Enables fast replay (C_WF) if no miss |
-| `rar_nack` | Bool | `s2_rar_nack` | RAR queue full | Blocks fast replay, causes C_RAR slow replay |
-| `raw_nack` | Bool | `s2_raw_nack` | RAW queue full | Blocks fast replay, causes C_RAW slow replay |
+| `rar_nack` | Bool | `s2_rar_nack` | RAR query not accepted (no free entry) | Blocks fast replay, causes C_RAR slow replay |
+| `raw_nack` | Bool | `s2_raw_nack` | RAW query not accepted (no free entry) | Blocks fast replay, causes C_RAW slow replay |
 | `nuke` | Bool | `s2_nuke` | Store-load ordering violation | Conditional fast replay (C_NK) if no other issues |
 | `full_fwd` | Bool | `s2_data_fwded` | All bytes forwarded (miss satisfied) | Suppresses miss handling if forward covers data |
 | `data_inv_sq_idx` | SqPtr | `io.lsq.forward.dataInvalidSqIdx` | SQ index with missing data | Precise wakeup when store data ready |
@@ -579,6 +579,15 @@ The `rep_info` structure (populated in S2, used in S3) contains all replay metad
 | `last_beat` | Bool | `s2_in.paddr(log2Up(refillBytes))` | Last beat of multi-beat refill | Scheduling priority for multi-beat loads |
 | `tlb_id` | UInt | `io.tlb_hint.id` | TLB filter entry ID | Precise wakeup when TLB refills |
 | `tlb_full` | Bool | `io.tlb_hint.full` | TLB filter full indicator | Affects TLB hint scheduling |
+
+**Verification (why NACK == queue full)**:
+- `s2_rar_nack` and `s2_raw_nack` are defined as `req.valid && !req.ready` in LoadUnit S2.
+- In `LoadQueueRAR` / `LoadQueueRAW`, `req.ready` is only deasserted when the request **needs enqueue** and the freelist **cannot allocate** (no free entry). If enqueue is not needed, `ready` is forced true.
+- Therefore, a NACK here specifically means **queue full / no allocation slot**, not a data hazard.
+
+**Clarification (dispatch vs. S2 allocation)**:
+- RAR/RAW queues are **not** allocated at dispatch. They are **micro‑queues for ordering checks** and are **allocated on demand in LoadUnit S2** when a load issues the query.
+- If the queue is full, the load cannot be tracked for ordering → **forced slow replay** (`C_RAR` / `C_RAW`), and **fast replay is blocked** by these NACKs.
 
 ### Replay Decision Logic (S3)
 
