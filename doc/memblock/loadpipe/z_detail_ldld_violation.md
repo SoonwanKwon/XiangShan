@@ -253,6 +253,206 @@ val needEnqueue = canEnqueue.zip(hasNotWritebackedLoad).zip(cancelEnqueue).map {
 
 **Key Insight**: RAR Queue only tracks loads that have **older in-flight loads**. If a load has no older loads pending, it cannot cause a load-load violation, so it's not enqueued.
 
+---
+
+## Entry Allocation and Deallocation Lifecycle
+
+### Understanding lqIdx and ldWbPtr
+
+The RAR Queue's allocation and deallocation is tightly coupled with the **Virtual Load Queue** (VLQ) through two key concepts:
+
+| Concept | Type | Description |
+|---------|------|-------------|
+| **lqIdx** | Load Queue Index | A unique identifier assigned to each load instruction when it's dispatched. Acts as a "birth certificate" tracking the load's position in program order within the load stream. |
+| **ldWbPtr** | Load Writeback Pointer | A pointer maintained by the Virtual Load Queue that tracks the **oldest load that has NOT yet written back**. All loads with `lqIdx ≤ ldWbPtr` have completed and written back their results. |
+
+**Key Relationship**:
+```
+isAfter(lqIdx, ldWbPtr) = true   →  Load is still in-flight (hasn't written back)
+isAfter(lqIdx, ldWbPtr) = false  →  Load has written back (completed)
+```
+
+The `isAfter` function compares circular queue pointers, handling wraparound correctly.
+
+### RAR Queue Entry Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Free: Initial state
+    Free --> Allocated: Load queries RAR<br/>(lqIdx > ldWbPtr)
+    Allocated --> Released: DCache releases data<br/>(released = true)
+    Allocated --> Deallocated: ldWbPtr advances<br/>(lqIdx ≤ ldWbPtr)
+    Released --> Deallocated: ldWbPtr advances<br/>(lqIdx ≤ ldWbPtr)
+    Deallocated --> Free: Entry returned to freelist
+
+    Allocated --> Revoked: Redirect/Flush/Replay
+    Released --> Revoked: Redirect/Flush/Replay
+    Revoked --> Free: Entry returned to freelist
+
+    Free --> [*]
+```
+
+### Allocation Logic
+
+An entry is allocated when a load queries the RAR Queue **if and only if**:
+
+1. **Freelist has space**: `freeList.io.canAlloc = true`
+2. **Query is valid**: `io.query.req.valid = true`
+3. **Has older in-flight loads**: `isAfter(lqIdx, ldWbPtr) = true`
+4. **Not being flushed**: `!uop.robIdx.needFlush(io.redirect)`
+
+**Critical Point**: The condition `isAfter(lqIdx, ldWbPtr) = true` means "this load has older loads that haven't written back yet."
+
+### Deallocation Logic
+
+An entry is deallocated (freed) when **any** of these occurs:
+
+1. **Normal completion**: `ldWbPtr` advances past the entry's `lqIdx`
+   - When older loads complete and writeback, `ldWbPtr` moves forward
+   - Entries whose `lqIdx ≤ ldWbPtr` are no longer needed (no younger loads can violate against them)
+
+2. **Revocation**: Load needs replay, exception, or redirect
+   - Set via `io.query.revoke` signal from load pipeline
+   - Immediately deallocates the entry
+
+3. **Flush**: Pipeline flush due to redirect
+   - All entries with `robIdx.needFlush(io.redirect)` are deallocated
+
+### Why RAR Queue Becomes Full
+
+**RAR "full"** means the freelist cannot allocate an entry for a new load. This happens when:
+
+**Root Cause**: `ldWbPtr` is **stuck** (not advancing) while younger loads keep executing.
+
+**Why ldWbPtr gets stuck**:
+- Oldest loads are **blocked** on long-latency operations:
+  - L2/L3 cache misses
+  - TLB misses
+  - Replay queue stalls
+  - Store-load forwarding stalls
+  - Previous RAR violations causing cascading replays
+
+**Consequence**:
+1. `ldWbPtr` doesn't advance (stuck on oldest incomplete load)
+2. Younger loads continue issuing and querying RAR Queue
+3. Each younger load has `lqIdx > ldWbPtr` → all need RAR entries
+4. RAR entries aren't freed (because `ldWbPtr` hasn't moved past them)
+5. Freelist exhausts → `req.ready = false`
+6. New loads get **nacked** → replay with cause `C_RAR`
+
+### Example 1: Normal Operation (No Fullness)
+
+**Initial State**:
+- `ldWbPtr = 5` (loads 0-4 have written back)
+- RAR Queue: 2/16 entries used
+
+**Timeline**:
+
+| Cycle | Event | lqIdx | ldWbPtr | RAR Entries | Action |
+|-------|-------|-------|---------|-------------|--------|
+| 0 | Load A queries | 6 | 5 | 2 used | `isAfter(6,5)=true` → Allocate entry 0 |
+| 1 | Load B queries | 7 | 5 | 3 used | `isAfter(7,5)=true` → Allocate entry 1 |
+| 2 | Load C queries | 8 | 5 | 4 used | `isAfter(8,5)=true` → Allocate entry 2 |
+| 3 | Load A (lqIdx=6) completes | - | **6** | 3 used | `ldWbPtr` advances → Free entry 0 |
+| 4 | Load B (lqIdx=7) completes | - | **7** | 2 used | `ldWbPtr` advances → Free entry 1 |
+| 5 | Load D queries | 9 | 7 | 3 used | `isAfter(9,7)=true` → Allocate entry 0 (reused) |
+
+**Result**: Queue operates smoothly. As loads complete, `ldWbPtr` advances and frees entries.
+
+### Example 2: RAR Queue Becomes Full
+
+**Initial State**:
+- `ldWbPtr = 10` (loads 0-9 written back)
+- RAR Queue: 0/8 entries used (smaller queue for example)
+- LoadQueueRARSize = 8
+
+**Timeline**:
+
+| Cycle | Event | lqIdx | ldWbPtr | RAR Entries | Action |
+|-------|-------|-------|---------|-------------|--------|
+| 0 | Load A queries (L2 miss!) | 11 | 10 | 1 used | Allocate entry 0, **BLOCKED on L2 miss** |
+| 1 | Load B queries | 12 | 10 | 2 used | Allocate entry 1 |
+| 2 | Load C queries | 13 | 10 | 3 used | Allocate entry 2 |
+| 3 | Load D queries | 14 | 10 | 4 used | Allocate entry 3 |
+| 4 | Load E queries | 15 | 10 | 5 used | Allocate entry 4 |
+| 5 | Load F queries | 16 | 10 | 6 used | Allocate entry 5 |
+| 6 | Load G queries | 17 | 10 | 7 used | Allocate entry 6 |
+| 7 | Load H queries | 18 | 10 | 8 used | Allocate entry 7 (FULL!) |
+| 8 | Load I queries | 19 | **10** | **8 used** | ❌ `req.ready = false` → **NACK** (C_RAR) |
+
+**Problem**:
+- Load A (lqIdx=11) is **oldest in-flight load**, stuck on L2 miss
+- `ldWbPtr` is **stuck at 10** (waiting for Load A to complete)
+- Loads B-H all have `lqIdx > ldWbPtr` → all allocated entries
+- Load I needs entry, but freelist is **empty**
+- Load I is **nacked**, must replay later
+
+**Resolution**:
+
+| Cycle | Event | ldWbPtr | RAR Entries | Action |
+|-------|-------|---------|-------------|--------|
+| 20 | Load A's L2 miss resolves | 10 | 8 used | Load A gets data |
+| 21 | Load A writes back | **11** | 7 used | `ldWbPtr` advances → Free entry 0 |
+| 22 | Load B writes back | **12** | 6 used | `ldWbPtr` advances → Free entry 1 |
+| 23 | Load I replays | 10 | 6 used | Now `isAfter(19,12)=true` but freelist has space → Allocate ✓ |
+
+### Example 3: Cascading Effect with Violations
+
+**Scenario**: Load-load violations cause replays, which delay writeback, which stalls `ldWbPtr`, which fills RAR Queue.
+
+**Timeline**:
+
+| Cycle | Event | lqIdx | ldWbPtr | Notes |
+|-------|-------|-------|---------|-------|
+| 0 | Load A queries (addr 0x1000) | 10 | 9 | Allocate RAR entry |
+| 1 | Load B queries (addr 0x2000) | 11 | 9 | Allocate RAR entry |
+| 2 | Load C queries (addr 0x1000) | 12 | 9 | Allocate RAR entry |
+| 3 | Load C completes first (fast path) | - | 9 | Entry 2 released=true |
+| 4 | Load A queries (delayed) | - | 9 | **VIOLATION** detected (Load C at 0x1000 already done) |
+| 5 | Load A redirects | - | **9** | Replay Load A, flush Load B, Load C |
+| 6 | Entries revoked | - | 9 | RAR entries for B, C deallocated |
+| 7 | Load A re-issues | 10 | 9 | Allocate RAR entry (again) |
+| 8 | Load B re-issues | 11 | 9 | Allocate RAR entry (again) |
+| 9 | Load C re-issues | 12 | 9 | Allocate RAR entry (again) |
+| 10 | Load A completes | - | **10** | `ldWbPtr` finally advances |
+
+**Impact**: Violations cause replays → delays completion → stalls `ldWbPtr` → increases RAR Queue pressure.
+
+### Monitoring RAR Queue Fullness
+
+From LoadQueueRAR.scala:228-235:
+
+```scala
+val validCount = freeList.io.validCount
+val allowEnqueue = validCount <= (LoadQueueRARSize - LoadPipelineWidth).U
+XSPerfAccumulate("enq", canEnqCount)
+QueuePerf(LoadQueueRARSize, validCount, !allowEnqueue)
+```
+
+**Metrics**:
+- `validCount`: Number of allocated entries
+- `allowEnqueue`: Whether new allocations are allowed (leaves space for in-flight queries)
+- Queue is considered "full" when `validCount > (LoadQueueRARSize - LoadPipelineWidth)`
+
+### Impact on Performance
+
+| Scenario | RAR Queue Pressure | Performance Impact |
+|----------|-------------------|-------------------|
+| **Fast loads** (L1 hits) | Low (entries freed quickly) | Minimal |
+| **Occasional L2 miss** | Medium (temporary pressure) | Slight (1-2 nacks) |
+| **Frequent L2/L3 misses** | **High** (ldWbPtr stalls) | **Severe** (many C_RAR replays) |
+| **Load-load violations** | **High** (cascading replays) | **Severe** (redirect storms) |
+| **Memory-intensive workload** | **Very High** (sustained pressure) | **Critical** (throughput collapse) |
+
+**Typical Configuration**:
+- `LoadQueueRARSize = 16-32` entries (configurable)
+- `LoadPipelineWidth = 2` (2 queries/cycle)
+- Deallocation rate: up to 4 entries/cycle
+
+**Design Intent**: RAR Queue size is tuned to handle typical L1/L2 miss latencies without frequent fullness, while remaining small enough to minimize area and CAM power.
+
+---
+
 ### Violation Check Logic (LoadQueueRAR.scala:196-206)
 
 ```scala
@@ -384,13 +584,16 @@ val s3_flushPipe = s3_ldld_rep_inst
 ```scala
 io.rollback.valid := s3_valid && (s3_rep_frm_fetch || s3_flushPipe) && !s3_exception
 io.rollback.bits.level := Mux(s3_rep_frm_fetch, RedirectLevel.flush, RedirectLevel.flushAfter)
-                                                                      ^^^^^^^^^^^^^^^^^^^
-                                                                      Load-load violation uses flushAfter
 ```
+
+**Note**: `s3_rep_frm_fetch` (used in the Mux) is a **different signal** from the RAR queue's `resp.bits.rep_frm_fetch` (shown in line 372). When a load-load violation occurs:
+- RAR queue sets `resp.bits.rep_frm_fetch = true`, which sets `s3_flushPipe = true`
+- But `s3_rep_frm_fetch` remains `false` (it's set by other replay sources like RAW violations)
+- Result: Mux selects the **false branch** → `RedirectLevel.flushAfter`
 
 **Redirect level**: `RedirectLevel.flushAfter`
 - Flush instructions **after** (younger than) the violating load
-- The violating load itself is **replayed from fetch**
+- The violating load itself is **refetched and re-executed**
 - Older instructions continue normally
 
 ### Revocation on Replay (LoadUnit.scala:1087-1089)
@@ -598,12 +801,19 @@ When a load-load violation is detected:
 
 **Can false positives occur?**
 
-**No** - Load-load violation detection is **precise**:
+**Potentially, yes** - at cache line granularity:
 - Address match via CAM at **cache line granularity** (typically 64-byte aligned)
 - Age comparison via robIdx (exact program order)
 - Released flag (only if data actually obtained)
 
-Unlike some other violation detections (e.g., s1_nuke with 8-byte granularity), RAR Queue uses full cache line address comparison, minimizing false positives.
+**Implication**: Two loads to **different bytes within the same cache line** (e.g., addresses 0x1000 and 0x1008) will match in the CAM, potentially triggering a violation even though they access different memory locations.
+
+**Trade-off**: Cache line granularity matching is a deliberate design choice:
+- **Simpler hardware**: Reduces CAM complexity (fewer address bits to compare)
+- **Conservative correctness**: Ensures no actual violations are missed
+- **Acceptable false positive rate**: Load-load violations to the same cache line are relatively rare in practice
+
+Unlike store-load violation detection (e.g., s1_nuke with 8-byte granularity for higher precision), RAR Queue prioritizes simplicity and conservative detection over fine-grained matching.
 
 ### Performance Monitoring
 
