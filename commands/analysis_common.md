@@ -13,6 +13,8 @@ Define working scenarios and explain each with detailed sequence diagram
 2. Each logic should be clearly shown as pseudo code upon relevant request.
 3. The action via each connection should be clearly noted.
 4. To generate mermaid code safely, use the synatx like "   s3 --> o3["S3 resp + s3_redirect"]" when noting text.
+5. Interface names should be annotated on the arrows that connect modules or blocks.
+6. For pipeline analysis, include a table with columns: `stage_name`, `functional behavior at this stage`, `reg signals`.
 
 # Draw diagram with mermaid for pipeline, sequence and data structure also
 1. Include possible explanation 
@@ -26,4 +28,3 @@ Define working scenarios and explain each with detailed sequence diagram
   classDef logic fill:#e1f5fe,stroke:#01579b,stroke-width:1px;
   classDef io fill:#fce4ec,stroke:#880e4f,stroke-width:1px;
 ```
-
