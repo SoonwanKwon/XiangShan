@@ -6,7 +6,32 @@ XiangShan implements a **Three-Layer Defense** mechanism for memory disambiguati
 
 1. **Store-to-Load Forwarding** (Prevention) - Proactively forwards data from older stores to younger loads
 2. **s1_nuke** (Early Detection) - Detects violations when store addresses become ready
-3. **RAW Queue** (Late Detection) - CAM-based final safety net when stores complete
+3. **RAW/RAR Queue** (Late Detection) - CAM-based final safety net when stores complete or cache lines are released
+
+---
+
+## Memory Hazard Types
+
+XiangShan explicitly handles **two types** of memory hazards that require violation detection:
+
+### Hazard Classification
+
+| Hazard Type | Description | XiangShan Handling | Detection Module |
+|-------------|-------------|-------------------|------------------|
+| **RAW** (Read-After-Write) | Load reads data before older store writes | ✅ Explicit detection | LoadQueueRAW |
+| **RAR** (Read-After-Read) | Load-to-Load ordering violation (RVWMO) | ✅ Explicit detection | LoadQueueRAR |
+| **WAW** (Write-After-Write) | Store ordering violation | ❌ Not needed | In-order commit guarantees |
+| **WAR** (Write-After-Read) | Store writes before older load reads | ❌ Not needed | In-order commit guarantees |
+
+### Why Only RAW and RAR?
+
+1. **RAW (Store→Load)**: Load instructions can execute **speculatively** before older stores complete their address calculation. If the load and store overlap, the load may have read stale data → **Requires explicit violation detection**.
+
+2. **RAR (Load→Load)**: Under **RISC-V Weak Memory Ordering (RVWMO)**, loads to the same address must appear to execute in program order to external observers. If a younger load obtains data and then the cache line is released/modified by another core, the older load might see different data → **Requires explicit violation detection**.
+
+3. **WAW (Store→Store)**: Stores are **committed in program order** through the ROB. Even though stores execute out-of-order, they write to the Store Buffer and commit to memory in order → **No explicit detection needed**.
+
+4. **WAR (Load→Store)**: Stores commit after all older instructions (including loads) commit. This is guaranteed by the ROB → **No explicit detection needed**.
 
 ---
 
@@ -45,6 +70,7 @@ flowchart TB
     subgraph LSQ["Load/Store Queue"]
         SQ[(StoreQueue<br>StoreQueueSize)]:::memory
         RAW[(LoadQueueRAW<br>LoadQueueRAWSize)]:::memory
+        RAR[(LoadQueueRAR<br>LoadQueueRARSize)]:::memory
         LQR[(LoadQueueReplay<br>LoadQueueReplaySize)]:::memory
     end
 
@@ -70,6 +96,11 @@ flowchart TB
     LS2 -->|"io.lsq.stld_nuke_query"| RAW
     SS3 -->|"io.storeIn"| RAW
     RAW -->|"io.rollback"| RED[Pipeline Redirect]:::io
+
+    %% RAR Queue path
+    LS2 -->|"io.lsq.ldld_nuke_query"| RAR
+    DC -->|"io.release"| RAR
+    RAR -->|"rep_frm_fetch"| LQR
 
     %% Replay path
     LS3 -->|"io.lsq.ldin"| LQR
@@ -585,6 +616,159 @@ Total cycles = `ceil(log(LoadQueueRAWSize) / log(SelectGroupSize)) + 1`
 
 ---
 
+## Layer 3-B: RAR Queue (LoadQueueRAR)
+
+### Purpose
+
+**File**: `LoadQueueRAR.scala`
+
+The RAR Queue detects **Load-to-Load ordering violations** required by RISC-V Weak Memory Ordering (RVWMO). When a cache line is **released** (evicted or invalidated by coherence), younger loads that already obtained data from that line may have violated ordering with respect to older loads.
+
+### Entry Data Structure (LoadQueueRAR.scala:51-74)
+
+```scala
+// LoadQueueRAR entry structure
+val allocated = RegInit(VecInit(List.fill(LoadQueueRARSize)(false.B)))
+val uop       = Reg(Vec(LoadQueueRARSize, new MicroOp))
+val paddrModule = Module(new LqPAddrModule(...))  // CAM for paddr
+val released  = RegInit(VecInit(List.fill(LoadQueueRARSize)(false.B)))
+```
+
+| Field | Width | Data Type | Description |
+|-------|-------|-----------|-------------|
+| allocated | 1 | Bool | Entry is valid |
+| uop | MicroOp | Bundle | Micro-op (robIdx, lqIdx for age comparison) |
+| paddr | PAddrBits (36) | UInt | Physical address (CAM key) |
+| released | 1 | Bool | Cache line has been released |
+
+### RAR Queue Lifecycle
+
+```mermaid
+flowchart TB
+    %% styling
+    classDef memory fill:#e8f5e9,stroke:#1b5e20,stroke-width:1px;
+    classDef reg fill:#fff3e0,stroke:#e65100,stroke-width:1px;
+    classDef logic fill:#e1f5fe,stroke:#01579b,stroke-width:1px;
+    classDef io fill:#fce4ec,stroke:#880e4f,stroke-width:1px;
+
+    subgraph RAR["LoadQueueRAR (LoadQueueRARSize entries)"]
+        direction TB
+
+        subgraph Fields["Entry Fields"]
+            AL["allocated: Bool"]:::reg
+            UOP["uop: MicroOp"]:::reg
+            REL["released: Bool"]:::reg
+        end
+
+        PA[("paddrModule<br>CAM")]:::memory
+
+        subgraph Logic["Detection Logic"]
+            DET["releaseViolationMmask"]:::logic
+            SEL["Select violating<br>entries"]:::logic
+        end
+    end
+
+    LQ["Load S2<br>io.query"]:::io
+    DC["D-Channel<br>io.release"]:::io
+    OUT["io.query.resp<br>rep_frm_fetch"]:::io
+
+    LQ -->|"enqueue"| AL
+    LQ --> PA
+    DC -->|"release"| REL
+    PA --> DET
+    REL --> DET
+    DET --> SEL
+    SEL --> OUT
+```
+
+### Enqueue Condition (LoadQueueRAR.scala:99-102)
+
+A load enqueues to RAR Queue when:
+1. Load query is valid
+2. There are **not-yet-completed loads** before current load (`hasNotWritebackedLoad`)
+
+```scala
+val canEnqueue = io.query.map(_.req.valid)
+val cancelEnqueue = io.query.map(_.req.bits.uop.robIdx.needFlush(io.redirect))
+val hasNotWritebackedLoad = io.query.map(_.req.bits.uop.lqIdx).map(lqIdx => isAfter(lqIdx, io.ldWbPtr))
+val needEnqueue = canEnqueue.zip(hasNotWritebackedLoad).zip(cancelEnqueue).map {
+  case ((v, r), c) => v && r && !c
+}
+```
+
+### Release Detection (LoadQueueRAR.scala:210-223)
+
+When `io.release` fires (cache line released by D-Channel), update the `released` flag:
+
+```scala
+when (release1Cycle.valid) {
+  paddrModule.io.releaseMdata.takeRight(1)(0) := release1Cycle.bits.paddr
+}
+
+(0 until LoadQueueRARSize).map(i => {
+  when (RegNext(paddrModule.io.releaseMmask.takeRight(1)(0)(i) &&
+                allocated(i) && release1Cycle.valid)) {
+    released(i) := true.B  // Mark as released
+  }
+})
+```
+
+### Violation Detection (LoadQueueRAR.scala:183-207)
+
+```scala
+// Load-to-Load violation check condition:
+// 1. Physical address match by CAM port
+// 2. released is set (cache line was evicted/invalidated)
+// 3. Entry is younger than current load instruction
+
+for ((query, w) <- io.query.zipWithIndex) {
+  paddrModule.io.releaseViolationMdata(w) := query.req.bits.paddr
+
+  // Generate violation mask
+  val robIdxMask = VecInit(uop.map(_.robIdx).map(isAfter(_, query.req.bits.uop.robIdx)))
+  val matchMask = (0 until LoadQueueRARSize).map(i => {
+    RegNext(allocated(i) &
+            paddrModule.io.releaseViolationMmask(w)(i) &  // paddr match
+            robIdxMask(i) &&                               // younger load
+            released(i))                                   // cache line released
+  })
+
+  // If any match, signal violation
+  query.resp.bits.rep_frm_fetch := ParallelORR(matchMask)
+}
+```
+
+### Dequeue Condition (LoadQueueRAR.scala:157-165)
+
+An entry is deallocated when:
+1. All older loads have been writebacked (`!isBefore(ldWbPtr, lqIdx)`)
+2. Or the load is flushed by redirect
+
+```scala
+for (i <- 0 until LoadQueueRARSize) {
+  val deqNotBlock = !isBefore(io.ldWbPtr, uop(i).lqIdx)
+  val needFlush = uop(i).robIdx.needFlush(io.redirect)
+
+  when (allocated(i) && (deqNotBlock || needFlush)) {
+    allocated(i) := false.B
+    freeMaskVec(i) := true.B
+  }
+}
+```
+
+### RAR vs RAW Comparison
+
+| Aspect | LoadQueueRAW | LoadQueueRAR |
+|--------|--------------|--------------|
+| **Hazard** | Store→Load (RAW) | Load→Load (RAR) |
+| **Trigger** | Store complete (S3) | Cache line release |
+| **Detection Key** | Store addr/mask overlap | Same cache line + released |
+| **Age Comparison** | Load younger than Store | Entry younger than querying Load |
+| **Recovery** | Pipeline redirect | Load replay (rep_frm_fetch) |
+| **Replay Cause** | C_NK (nuke) | C_RAR |
+
+---
+
 ## LoadQueueReplay
 
 ### Structure
@@ -682,19 +866,30 @@ flowchart TB
 
 ### Three-Layer Defense Comparison
 
-| Layer | Mechanism | Trigger Point | Detection Method | Recovery | Typical Latency |
-|-------|-----------|--------------|------------------|----------|-----------------|
-| **Layer 1** | Store-to-Load Forwarding | Load S1/S2 | CAM query in SQ/Sbuffer | Data forwarding | 0 cycles (best case) |
-| **Layer 2** | s1_nuke | Store S1 (addr ready) | Broadcast + paddr/mask compare | Load replay | ~30-50 cycles |
-| **Layer 3** | RAW Queue | Store S3 (complete) | CAM query in RAW Queue | Pipeline redirect | ~25-40 cycles |
+| Layer | Mechanism | Hazard Type | Trigger Point | Detection Method | Recovery |
+|-------|-----------|-------------|--------------|------------------|----------|
+| **Layer 1** | Store-to-Load Forwarding | RAW | Load S1/S2 | CAM query in SQ/Sbuffer | Data forwarding |
+| **Layer 2** | s1_nuke | RAW | Store S1 (addr ready) | Broadcast + paddr/mask compare | Load replay |
+| **Layer 3-A** | RAW Queue | RAW | Store S3 (complete) | CAM query in RAW Queue | Pipeline redirect |
+| **Layer 3-B** | RAR Queue | RAR | Cache line release | CAM query + released flag | Load replay |
+
+### Memory Hazard Summary
+
+| Hazard | Description | Detection | Recovery |
+|--------|-------------|-----------|----------|
+| **RAW** | Load executes before older store | LoadQueueRAW + s1_nuke | Redirect / Replay |
+| **RAR** | Load-to-load ordering (RVWMO) | LoadQueueRAR | Replay (C_RAR) |
+| **WAW** | Store-to-store ordering | ❌ Not needed | In-order commit |
+| **WAR** | Load-to-store ordering | ❌ Not needed | In-order commit |
 
 ### Coverage
 
 - **Layer 1 (Forwarding)**: Handles ~95%+ of store-load dependencies proactively
-- **Layer 2 (s1_nuke)**: Catches violations when store address becomes ready
-- **Layer 3 (RAW Queue)**: Final safety net for all remaining violations
+- **Layer 2 (s1_nuke)**: Catches RAW violations when store address becomes ready
+- **Layer 3-A (RAW Queue)**: Final safety net for RAW violations when stores complete
+- **Layer 3-B (RAR Queue)**: Ensures load-to-load ordering under RVWMO
 
-This multi-layered design minimizes average latency (most cases resolved by forwarding) while guaranteeing correctness (RAW Queue catches all violations).
+This multi-layered design minimizes average latency (most cases resolved by forwarding) while guaranteeing correctness (RAW/RAR Queues catch all violations).
 
 ---
 
@@ -705,7 +900,8 @@ This multi-layered design minimizes average latency (most cases resolved by forw
 | [MemCommon.scala](../../src/main/scala/xiangshan/mem/MemCommon.scala) | Core data structures (LoadForwardQueryIO, etc.) |
 | [LoadUnit.scala](../../src/main/scala/xiangshan/mem/pipeline/LoadUnit.scala) | Load pipeline with forwarding and nuke check |
 | [StoreUnit.scala](../../src/main/scala/xiangshan/mem/pipeline/StoreUnit.scala) | Store pipeline with nuke broadcast |
-| [LoadQueueRAW.scala](../../src/main/scala/xiangshan/mem/lsqueue/LoadQueueRAW.scala) | RAW violation detection |
+| [LoadQueueRAW.scala](../../src/main/scala/xiangshan/mem/lsqueue/LoadQueueRAW.scala) | RAW (Store→Load) violation detection |
+| [LoadQueueRAR.scala](../../src/main/scala/xiangshan/mem/lsqueue/LoadQueueRAR.scala) | RAR (Load→Load) violation detection |
 | [LoadQueueReplay.scala](../../src/main/scala/xiangshan/mem/lsqueue/LoadQueueReplay.scala) | Load replay management |
 | [StoreQueue.scala](../../src/main/scala/xiangshan/mem/lsqueue/StoreQueue.scala) | Store forwarding logic |
 
@@ -716,10 +912,16 @@ This multi-layered design minimizes average latency (most cases resolved by forw
 | Term | Description |
 |------|-------------|
 | **RAW** | Read-After-Write hazard (load reads data before store writes) |
+| **RAR** | Read-After-Read hazard (load-to-load ordering violation under RVWMO) |
+| **WAW** | Write-After-Write hazard (store ordering - handled by in-order commit) |
+| **WAR** | Write-After-Read hazard (handled by in-order commit) |
+| **RVWMO** | RISC-V Weak Memory Ordering (memory model) |
 | **CAM** | Content-Addressable Memory (parallel lookup by content) |
 | **Nuke** | Pipeline flush due to Store-Load violation |
 | **Forwarding** | Bypassing store data to load without cache access |
 | **Replay** | Re-execute load instruction from LoadQueueReplay |
 | **Redirect** | Pipeline flush and instruction re-fetch from frontend |
 | **sqIdx** | Store Queue index (circular queue pointer) |
+| **lqIdx** | Load Queue index (circular queue pointer) |
 | **robIdx** | ROB index (used for age comparison) |
+| **released** | Cache line evicted or invalidated by coherence protocol |

@@ -15,6 +15,7 @@ Define working scenarios and explain each with detailed sequence diagram
 4. To generate mermaid code safely, use the synatx like "   s3 --> o3["S3 resp + s3_redirect"]" when noting text.
 5. Interface names should be annotated on the arrows that connect modules or blocks.
 6. For pipeline analysis, include a table with columns: `stage_name`, `functional behavior at this stage`, `reg signals`.
+7. For pipeline analysis, describe backpressure control at each stage in detail. Clearly distinguish the conditions that trigger backpressure from those that release it, and, if possible, specify related signals such as handshake/valid-ready, stall/flush, and credit.
 
 # Draw diagram with mermaid for pipeline, sequence and data structure also
 1. Include possible explanation 

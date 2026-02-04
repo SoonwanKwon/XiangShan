@@ -44,6 +44,7 @@ flowchart TB
     sta_s2["S2: PMP Check<br>MMIO Detect"]:::logic
     sta_s3["S3+: Writeback"]:::logic
     sta_s0 --> sta_s1 --> sta_s2 --> sta_s3
+    
   end
 
   subgraph DCacheStore["StorePipe (DCache)"]
@@ -162,6 +163,177 @@ class LsPipelineBundle {
   // ... additional fields omitted
 }
 ```
+
+---
+
+## Store Address/Data Split Issue
+
+### Overview
+
+XiangShan implements **split store address/data issue**:
+
+- **STA (Store Address)**: Issues from reservation station when base + offset operands are ready
+- **STD (Store Data)**: Issues separately when store data operand is ready
+
+This split-issue design allows stores to:
+1. Reserve resources early (via STA issue)
+2. Participate in store-to-load forwarding as soon as address is known
+3. Overlap address calculation with data computation
+
+### StoreQueue State Tracking
+
+StoreQueue maintains separate valid flags for address and data (StoreQueue.scala:129-131):
+
+```scala
+val addrvalid = RegInit(VecInit(List.fill(StoreQueueSize)(false.B))) // addr ready
+val datavalid = RegInit(VecInit(List.fill(StoreQueueSize)(false.B))) // data ready
+val allvalid  = VecInit((0 until StoreQueueSize).map(i =>
+  addrvalid(i) && datavalid(i))) // both ready
+```
+
+### Issue Readiness from Reservation Station
+
+Store instructions can issue **independently** for address and data:
+
+| Component | Ready Condition | Issued To |
+|-----------|----------------|-----------|
+| **STA (Address)** | `src(0)` (base register) ready | StoreUnit (STA Pipeline) |
+| **STD (Data)** | `src(1)` (data register) ready | StoreQueue directly |
+
+**Key Points**:
+- STA and STD issue **independently** when their respective operands are ready
+- A store instruction may issue STA first, STD first, or both simultaneously
+- RS tracks issue status separately for address and data operations
+
+### Issue Cases and StoreQueue Entry States
+
+| Case | Operands Ready | addrvalid | datavalid | STA Issued | STD Issued | Forwarding | Commit to Sbuffer |
+|------|----------------|-----------|-----------|------------|------------|------------|-------------------|
+| **1. Nothing Ready** | None | false | false | ❌ Waiting | ❌ Waiting | ❌ Cannot forward | ❌ Cannot commit |
+| **2. Base Ready** | `src(0)` only | true | false | ✅ Issued | ❌ Waiting | ⚠️ `dataInvalid` replay | ❌ Cannot commit |
+| **3. Data Ready** | `src(1)` only | false | true | ❌ Waiting | ✅ Issued | ⚠️ `addrInvalid` replay | ❌ Cannot commit |
+| **4. Both Ready** | Both `src(0,1)` | true | true | ✅ Issued | ✅ Issued | ✅ Full forward | ✅ Ready after commit |
+
+### Issue Flow
+
+```mermaid
+sequenceDiagram
+    participant RS as Reservation Station
+    participant STA as STA Pipeline
+    participant STD as STD Pipeline
+    participant SQ as StoreQueue
+    participant FWD as Forwarding Logic
+
+    Note over RS: Store uop dispatched
+    RS->>SQ: Allocate entry (allocated=true)
+    Note over SQ: addrvalid=false, datavalid=false
+
+    alt STA Ready First
+        RS->>STA: Issue STA (base+offset ready)
+        STA->>SQ: storeAddrIn.fire
+        Note over SQ: addrvalid=true
+        SQ->>FWD: Can match address<br/>but no data yet
+
+        Note over RS: Later, when data ready
+        RS->>STD: Issue STD
+        STD->>SQ: storeDataIn.fire
+        Note over SQ: datavalid=true
+        SQ->>FWD: Full forwarding enabled
+    end
+
+    alt STD Ready First
+        RS->>STD: Issue STD (data ready)
+        STD->>SQ: storeDataIn.fire
+        Note over SQ: datavalid=true
+
+        Note over RS: Later, when base+offset ready
+        RS->>STA: Issue STA
+        STA->>SQ: storeAddrIn.fire
+        Note over SQ: addrvalid=true
+        SQ->>FWD: Full forwarding enabled
+    end
+
+    Note over SQ: After both valid + committed
+    SQ->>Sbuffer: Dequeue to Sbuffer
+```
+
+### Ready Pointers (StoreQueue.scala:143-144, 241-278)
+
+StoreQueue tracks separate ready pointers:
+
+```scala
+val addrReadyPtrExt = RegInit(0.U.asTypeOf(new SqPtr))  // oldest addr-ready entry
+val dataReadyPtrExt = RegInit(0.U.asTypeOf(new SqPtr))  // oldest data-ready entry
+
+// Addr ready lookup
+val addrReadyLookup = addrReadyLookupVec.map(ptr =>
+  allocated(ptr.value) && (mmio(ptr.value) || addrvalid(ptr.value)) &&
+  ptr =/= enqPtrExt(0))
+
+// Data ready lookup
+val dataReadyLookup = dataReadyLookupVec.map(ptr =>
+  allocated(ptr.value) && (mmio(ptr.value) || datavalid(ptr.value)) &&
+  ptr =/= enqPtrExt(0))
+```
+
+These pointers are used by:
+- **Load RAW Queue**: Checks if older stores have addresses ready
+- **Replay mechanism**: Wakes up loads waiting for store addr/data
+
+### Impact on Store-to-Load Forwarding
+
+When a load queries StoreQueue for forwarding (see [memory_disambiguation.md](memory_disambiguation.md)):
+
+#### Case 1: Address Ready, Data Not Ready
+```scala
+// StoreQueue.scala:~450-500 (forwarding logic)
+val addr_only_match = vaddr_match & addrvalid & ~datavalid
+
+when (addr_only_match.any()) {
+  io.forward.dataInvalid := true.B  // Trigger load replay (C_FF cause)
+}
+```
+- Load matches the address range
+- But store data is not yet available
+- **Result**: Load replays with `LoadReplayCauses.C_FF` (Forward Fail)
+
+#### Case 2: Address Not Ready
+```scala
+val hasAddrInvalidStore = io.query.map(_.req.bits.uop.sqIdx).map(sqIdx => {
+  Mux(!allAddrCheck, isBefore(io.stAddrReadySqPtr, sqIdx), false.B)
+})
+```
+- Older stores exist without known addresses
+- **Result**: Load replays with `LoadReplayCauses.C_MA` (Memory Ambiguity)
+
+#### Case 3: Both Ready
+```scala
+// Full forwarding path
+val data_match = vaddr_match & allvalid  // addrvalid && datavalid
+
+for (byte <- 0 until VLEN/8) {
+  when (data_match(byte)) {
+    io.forward.forwardMask(byte) := true.B
+    io.forward.forwardData(byte) := dataModule.read(matched_entry, byte)
+  }
+}
+```
+- Load can successfully forward data from StoreQueue
+- No replay needed
+
+### Commit to Sbuffer
+
+A store can only dequeue to Sbuffer when:
+
+```scala
+// Dequeue condition (StoreQueue.scala:~600)
+val canDequeue = allocated(deqPtr) &&
+                 committed(deqPtr) &&
+                 allvalid(deqPtr) &&    // Both addr and data ready!
+                 !pending(deqPtr)
+```
+
+**CRITICAL**: Even if a store is committed by ROB, it cannot write to Sbuffer until **both** address and data are available.
 
 ---
 
@@ -626,12 +798,46 @@ flowchart TB
 ### Store Lifecycle
 
 ```
-1. Dispatch → allocated := true
+1. Dispatch → allocated := true, addrvalid := false, datavalid := false
+
 2. STA writeback → addrvalid := true, paddr/vaddr written
+   (StoreQueue.scala:296-352: io.storeAddrIn)
+
 3. STD writeback → datavalid := true, data written
+   (StoreQueue.scala:354-386: io.storeDataIn)
+
+   ⚠️ Steps 2 and 3 can occur in ANY ORDER or in parallel!
+   - If STD issues first: datavalid=true, addrvalid=false
+   - If STA issues first: addrvalid=true, datavalid=false
+   - Both must complete before dequeue to Sbuffer
+
 4. ROB commit → committed := true
-5. Sbuffer transfer → allocated := false (dequeue)
+
+5. Dequeue to Sbuffer → allocated := false
+   (Only when: committed && addrvalid && datavalid)
 ```
+
+### Separate Address/Data Input Ports
+
+StoreQueue receives address and data through **separate interfaces** (StoreQueue.scala:69-71):
+
+```scala
+// Address input from STA pipeline
+val storeAddrIn = Vec(StorePipelineWidth, Flipped(Valid(new LsPipelineBundle)))
+
+// Data input from STD pipeline
+val storeDataIn = Vec(StorePipelineWidth, Flipped(Valid(new ExuOutput)))
+
+// Mask input from RS (sent early in S0)
+val storeMaskIn = Vec(StorePipelineWidth, Flipped(Valid(new StoreMaskBundle)))
+```
+
+**Write Timing**:
+1. **Mask** (S0): Written when STA issues, sent to SQ immediately
+2. **Address** (S1): Written when STA completes TLB lookup
+3. **Data** (variable): Written when STD issues from RS
+
+These writes are **independent** and can occur in any order.
 
 ### Store-to-Load Forwarding
 
