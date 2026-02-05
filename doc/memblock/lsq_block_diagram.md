@@ -26,8 +26,16 @@ This document describes the detailed block diagram of the Load Store Queue (LSQ)
 LsExuCnt is fundamentally determined by LsDqDeqWidth (dispatch throughput), not by execution unit count.
 
 ### Queue Sizes
-- **VirtualLoadQueueSize**: 80 (default, configurable)
-- **StoreQueueSize**: 64 (default, configurable)
+- **ROB Size**: 192 (Reorder Buffer)
+- **VirtualLoadQueueSize**: 80 (tracks ALL loads, 42% of ROB)
+- **LoadQueueReplaySize**: 72 (tracks replay-needed loads only, 38% of ROB)
+- **StoreQueueSize**: 64 (tracks ALL stores, 33% of ROB)
+
+**Design Rationale:**
+- VirtualLoadQueue (80) must be large enough to hold all in-flight loads in the 192-entry ROB
+- Typical workload has ~40% loads, so 80 entries provides adequate coverage
+- LoadQueueReplay (72) is smaller since not all loads miss/replay (typical miss rate: 5-20%)
+- This sizing allows high Memory Level Parallelism (MLP) for memory-intensive workloads
 
 ## Top-Level Block Diagram
 
@@ -256,7 +264,492 @@ Queue State Visualization (VirtualLoadQueueSize = 80):
   Each cycle, all 4 pointers advance together by enqNumber
 ```
 
-### 2. Load Unit Complete Interface Block Diagram
+### 2. Distribution from LSQ to Load/Store Pipelines
+
+After instructions enter the LSQ during dispatch, they must be issued to the physical load/store execution units. XiangShan has **2 Load Units** and **2 Store Units**. This section describes how instructions are distributed from LSQ to these pipelines.
+
+#### 2.1 Load Pipeline Distribution (LSQ → Load Units)
+
+**Configuration:**
+- LoadPipelineWidth = 2
+- LduCnt = 2 (Load Unit count)
+- VirtualLoadQueueSize = 80 (tracks ALL loads from dispatch to commit)
+- LoadQueueReplaySize = 72 (tracks ONLY loads that need replay)
+
+**Architecture Overview:**
+
+XiangShan uses **two separate queues** for load tracking:
+
+1. **VirtualLoadQueue (80 entries)**: Tracks **ALL** loads from dispatch to commit
+   - Allocated at dispatch (Rename stage)
+   - Deallocated at commit
+   - Purpose: lqIdx assignment, exception tracking, commit ordering
+   - Always has entry for every in-flight load
+
+2. **LoadQueueReplay (72 entries)**: Tracks **ONLY** loads that need replay
+   - Allocated when Load Unit S3 detects `need_rep == true`
+   - Deallocated when replay completes successfully or instruction commits
+   - Purpose: Replay scheduling and distribution to Load Units
+   - Smaller than VLQ because not all loads need replay
+
+```
+Load Lifecycle:
+┌─────────────────────────────────────────────────────────────┐
+│ Dispatch → VirtualLoadQueue [Entry X allocated]            │
+│     │                                                       │
+│     ├──► Load Unit (first issue from RS)                   │
+│     │        │                                              │
+│     │        ├──► Hit → Commit                              │
+│     │        │          └─► VLQ[X] deallocated             │
+│     │        │                                              │
+│     │        └──► Miss/Replay (S3: need_rep=true)          │
+│     │                │                                      │
+│     │                └──► LoadQueueReplay [Entry Y allocated]│
+│     │                         │                             │
+│     │                         ├──► Replay → Hit             │
+│     │                         │      └─► LQReplay[Y] dealloc│
+│     │                         │          VLQ[X] continues   │
+│     │                         │                             │
+│     └──────────────────── Commit ─────────────────────────► │
+│                                  VLQ[X] deallocated         │
+└─────────────────────────────────────────────────────────────┘
+
+Key: VLQ entry lives entire time (dispatch→commit)
+     LQReplay entry only during replay period
+```
+
+LoadQueueReplay implements a **striped oldest-first distribution** scheme to issue replays to the 2 Load Units in parallel.
+
+**Key Components (LoadQueueReplay.scala):**
+
+```scala
+// LoadQueueReplay outputs (LoadQueueReplay.scala:170)
+val replay = Vec(LoadPipelineWidth, Decoupled(new LsPipelineBundle))
+
+// Connection in MemBlock.scala:631
+loadUnits(i).io.replay <> lsq.io.replay(i)
+```
+
+**Distribution Mechanism:**
+
+LoadQueueReplay divides its 72 entries into **2 interleaved stripes** for parallel processing:
+
+```
+Entry Striping (LoadQueueReplaySize = 72):
+┌──────────────────────────────────────────────────────────────────┐
+│ Stripe 0 (for LoadUnit[0]):  0,  2,  4,  6, ..., 68, 70        │
+│ Stripe 1 (for LoadUnit[1]):  1,  3,  5,  7, ..., 69, 71        │
+└──────────────────────────────────────────────────────────────────┘
+
+Implementation (LoadQueueReplay.scala:342-348):
+  def getRemBits(input: UInt)(rem: Int): UInt = {
+    VecInit((0 until LoadQueueReplaySize / LoadPipelineWidth).map(i => {
+      input(LoadPipelineWidth * i + rem)
+    })).asUInt
+  }
+
+  // rem=0 extracts entries [0, 2, 4, ...]
+  // rem=1 extracts entries [1, 3, 5, ...]
+```
+
+**Selection Logic (3-Stage Pipeline):**
+
+LoadQueueReplay uses a **3-stage pipeline** (s0, s1, s2) to select and issue replays:
+
+**Stage 0 (s0): Oldest Selection with Priority**
+
+Each Load Unit gets an independent oldest-first selector operating on its stripe:
+
+```scala
+// LoadQueueReplay.scala:351-352
+val s0_oldestSel = Wire(Vec(LoadPipelineWidth, Valid(UInt(LoadQueueReplaySize.W))))
+val s1_can_go = Wire(Vec(LoadPipelineWidth, Bool()))
+
+// Selection priority (LoadQueueReplay.scala:388-407):
+// 1. L2 hint wake-up loads (highest priority)
+//    - Loads blocked on cache miss, woken early when L2 GrantData incoming
+//    - Condition: s0_loadHintWakeMask(i) = allocated && cause(C_DM) &&
+//                 blocking && missMSHRId matches l2_hint.sourceId
+//
+// 2. Higher-priority replay causes
+//    - C_DM: DCache miss
+//    - C_FF: Forward fail (store-to-load forwarding failed)
+//    - Condition: s0_loadHigherPriorityReplaySelMask(i) =
+//                 allocated && !scheduled && !blocking && hasHigherPriority
+//
+// 3. Lower-priority replay causes
+//    - C_MA: Store addr miss (blocked waiting for store address)
+//    - C_TM: TLB miss
+//    - C_RAW/C_RAR: Memory ordering violation
+//    - C_NK: Nuke (pipeline flush)
+//    - Condition: s0_loadLowerPriorityReplaySelMask(i) =
+//                 allocated && !scheduled && !blocking && !hasHigherPriority
+
+// For each LoadPipelineWidth port (LoadQueueReplay.scala:427-452):
+s0_oldestSel := VecInit((0 until LoadPipelineWidth).map(rport => {
+  // Age-based selection within stripe
+  val ageOldest = AgeDetector(
+    LoadQueueReplaySize / LoadPipelineWidth,  // 36 entries per stripe
+    s0_remEnqSelVec(rport),      // Enqueue mask
+    s0_remFreeSelVec(rport),     // Free mask
+    s0_remPriorityReplaySelVec(rport)  // Ready candidates with priority
+  )
+
+  // Program-order oldest selection (for L2 hint priority)
+  val issOldestValid = l2HintFirst || ParallelORR(s0_remOldestSelVec(rport))
+  val issOldestIndexOH = Mux(l2HintFirst,
+                             PriorityEncoderOH(s0_remOldestHintSelVec(rport)),
+                             PriorityEncoderOH(s0_remOldestSelVec(rport)))
+
+  // Final selection: program order oldest if available, else age oldest
+  val oldestSel = Mux(issOldestValid, issOldestIndexOH, ageOldestIndexOH)
+
+  oldest.valid := ageOldest.valid || issOldestValid
+  oldest.bits := oldestBitsVec.asUInt  // One-hot encoding
+  oldest
+}))
+```
+
+**Stage 1 (s1): Register and Schedule**
+
+```scala
+// LoadQueueReplay.scala:465-478
+for (i <- 0 until LoadPipelineWidth) {
+  val s0_can_go = s1_can_go(i) ||
+                  uop(s1_oldestSel(i).bits).robIdx.needFlush(io.redirect) ||
+                  uop(s1_oldestSel(i).bits).robIdx.needFlush(RegNext(io.redirect))
+
+  // Register selection
+  s1_oldestSel(i).valid := RegEnable(s0_oldestSel(i).valid, s0_can_go)
+  s1_oldestSel(i).bits := RegEnable(OHToUInt(s0_oldestSel(i).bits), s0_can_go)
+
+  // Mark as scheduled when selected
+  for (j <- 0 until LoadQueueReplaySize) {
+    when (s0_can_go && s0_oldestSel(i).valid && s0_oldestSelIndexOH(j)) {
+      scheduled(j) := true.B
+    }
+  }
+}
+```
+
+**Stage 2 (s2): Issue to Load Unit**
+
+```scala
+// LoadQueueReplay.scala:480-520
+for (i <- 0 until LoadPipelineWidth) {
+  val s1_cancel = uop(s1_oldestSel(i).bits).robIdx.needFlush(io.redirect) ||
+                  uop(s1_oldestSel(i).bits).robIdx.needFlush(RegNext(io.redirect))
+  val s1_oldestSelV = s1_oldestSel(i).valid && !s1_cancel
+
+  // Cold-down mechanism: prevents continuous replay flooding
+  // Only replay if: coldCounter < ColdDownThreshold
+  s1_can_go(i) := replayCanFire(i) && (!s2_oldestSel(i).valid || io.replay(i).fire) ||
+                  s2_cancelReplay(i)
+
+  s2_oldestSel(i).valid := RegEnable(Mux(s1_can_go(i), s1_oldestSelV, false.B),
+                                     (s1_can_go(i) || io.replay(i).fire))
+  s2_oldestSel(i).bits := RegEnable(s1_oldestSel(i).bits, s1_can_go(i))
+
+  // Output to Load Unit
+  io.replay(i).valid := s2_oldestSel(i).valid
+  io.replay(i).bits.uop := s2_replayUop
+  io.replay(i).bits.vaddr := vaddrModule.io.rdata(i)
+  io.replay(i).bits.isFirstIssue := false.B
+  io.replay(i).bits.isLoadReplay := true.B
+  io.replay(i).bits.replayCarry := s2_replayCarry
+  io.replay(i).bits.mshrid := s2_replayMSHRId
+  io.replay(i).bits.forward_tlDchannel := s2_replayCauses(LoadReplayCauses.C_DM)
+}
+```
+
+**Replay Cold-Down Mechanism:**
+
+To prevent replay flooding, a cold-down counter limits consecutive replays:
+
+```scala
+// LoadQueueReplay.scala:456-532
+val ColdDownCycles = 16
+val ColdDownThreshold = 12  // Configurable
+val coldCounter = RegInit(VecInit(List.fill(LoadPipelineWidth)(0.U)))
+
+def replayCanFire(i: Int) = coldCounter(i) >= 0.U && coldCounter(i) < ColdDownThreshold
+
+// Update logic:
+for (i <- 0 until LoadPipelineWidth) {
+  when (lastReplay(i) && io.replay(i).fire) {
+    coldCounter(i) := coldCounter(i) + 1.U  // Increment if consecutive replay
+  } .elsewhen (coldDownNow(i)) {
+    coldCounter(i) := coldCounter(i) + 1.U  // Continue counting in cold-down
+  } .otherwise {
+    coldCounter(i) := 0.U  // Reset if no replay
+  }
+}
+```
+
+**Distribution Summary:**
+
+```
+LoadQueueReplay (72 entries)
+         │
+         ├────────────────────────┬────────────────────────┐
+         │                        │                        │
+    Stripe 0                 Stripe 1                     │
+  (0,2,4,...,70)           (1,3,5,...,71)                │
+         │                        │                        │
+         │                        │                        │
+    ┌────▼────┐              ┌────▼────┐                  │
+    │ Oldest  │              │ Oldest  │                  │
+    │ Select  │              │ Select  │                  │
+    │  (s0)   │              │  (s0)   │                  │
+    └────┬────┘              └────┬────┘                  │
+         │                        │                        │
+    ┌────▼────┐              ┌────▼────┐                  │
+    │Register │              │Register │                  │
+    │  (s1)   │              │  (s1)   │                  │
+    └────┬────┘              └────┬────┘                  │
+         │                        │                        │
+    ┌────▼────┐              ┌────▼────┐                  │
+    │  Issue  │              │  Issue  │                  │
+    │  (s2)   │              │  (s2)   │                  │
+    └────┬────┘              └────┬────┘                  │
+         │                        │                        │
+         ▼                        ▼                        │
+   LoadUnit[0]              LoadUnit[1]                    │
+   io.replay                io.replay                      │
+```
+
+**Blocking Conditions Release:**
+
+Loads become ready for replay when their blocking conditions are resolved:
+
+```scala
+// LoadQueueReplay.scala:310-338
+for (i <- 0 until LoadQueueReplaySize) {
+  // C_MA: Store addr miss - wait for store address ready
+  when (cause(i)(C_MA)) {
+    blocking(i) := Mux(stAddrDeqVec(i), false.B, blocking(i))
+  }
+
+  // C_TM: TLB miss - wait for TLB hint response
+  when (cause(i)(C_TM)) {
+    blocking(i) := Mux(io.tlb_hint.resp.valid &&
+                       (io.tlb_hint.resp.bits.replay_all ||
+                        io.tlb_hint.resp.bits.id === tlbHintId(i)),
+                       false.B, blocking(i))
+  }
+
+  // C_FF: Forward fail - wait for store data ready
+  when (cause(i)(C_FF)) {
+    blocking(i) := Mux(stDataDeqVec(i), false.B, blocking(i))
+  }
+
+  // C_DM: DCache miss - wait for TileLink D channel grant
+  when (cause(i)(C_DM)) {
+    blocking(i) := Mux(io.tl_d_channel.valid &&
+                       io.tl_d_channel.mshrid === missMSHRId(i),
+                       false.B, blocking(i))
+  }
+
+  // C_RAR: RAR queue full - wait for queue space
+  when (cause(i)(C_RAR)) {
+    blocking(i) := Mux(!io.rarFull || !isAfter(uop(i).lqIdx, io.ldWbPtr),
+                       false.B, blocking(i))
+  }
+
+  // C_RAW: RAW queue full - wait for queue space
+  when (cause(i)(C_RAW)) {
+    blocking(i) := Mux(!io.rawFull || !isAfter(uop(i).sqIdx, io.stAddrReadySqPtr),
+                       false.B, blocking(i))
+  }
+}
+```
+
+#### 2.2 Store Pipeline Distribution (RS → Store Units)
+
+**Configuration:**
+- StorePipelineWidth = 2
+- StuCnt = 2 (Store Unit count)
+- StoreQueueSize = 64
+
+**Architecture Overview:**
+
+Unlike loads, stores do **NOT** have a replay mechanism from StoreQueue. Stores are issued **directly from Reservation Station** to the 2 Store Units. The store pipeline has two components:
+1. **STA (Store Address)**: Calculates store address and writes to StoreQueue
+2. **STD (Store Data)**: Sends store data to StoreQueue
+
+**Distribution Mechanism:**
+
+```
+Reservation Station
+         │
+         │ (Issue to Store Units)
+         ├────────────────┬────────────────┐
+         │                │                │
+         ▼                ▼                │
+    StoreUnit[0]     StoreUnit[1]         │
+         │                │                │
+         │ STA            │ STA            │
+         │ (S0→S1)        │ (S0→S1)        │
+         │                │                │
+         ▼                ▼                │
+    storeAddrIn[0]   storeAddrIn[1]       │
+         │                │                │
+         └────────┬───────┘                │
+                  │                        │
+                  ▼                        │
+            StoreQueue                     │
+         (Unified Storage)                 │
+                  │                        │
+         ┌────────┴────────┐               │
+         │                 │               │
+    addrvalid          datavalid           │
+    paddrModule        dataModule          │
+    vaddrModule                            │
+                                           │
+                  │                        │
+    (From RS)     │                        │
+         │        │                        │
+         ├────────┼────────┬───────────────┘
+         │        │        │
+         ▼        │        ▼
+    Std[0]       │    Std[1]
+    (S0)         │    (S0)
+         │       │        │
+         │       │        │
+    storeDataIn[0]   storeDataIn[1]
+         │                │
+         └────────┬───────┘
+                  │
+                  ▼
+            StoreQueue
+         (Update datavalid)
+```
+
+**Connection Details (MemBlock.scala:671-702):**
+
+```scala
+// Store Unit creation (MemBlock.scala:281)
+val storeUnits = Seq.fill(exuParameters.StuCnt)(Module(new StoreUnit))
+
+for (i <- 0 until exuParameters.StuCnt) {
+  val stu = storeUnits(i)
+
+  // 1. Store Address (STA) issue from RS
+  // MemBlock.scala:685
+  stu.io.stin <> io.ooo_to_mem.issue(exuParameters.LduCnt + i)
+  //   StoreUnit[0] ← issue(2)
+  //   StoreUnit[1] ← issue(3)
+
+  // 2. STA writeback to StoreQueue
+  // MemBlock.scala:686-687
+  stu.io.lsq <> lsq.io.sta.storeAddrIn(i)
+  stu.io.lsq_replenish <> lsq.io.sta.storeAddrInRe(i)
+  //   Writes: paddr, vaddr, mask, mmio flag
+
+  // 3. Store mask to StoreQueue
+  // MemBlock.scala:699
+  lsq.io.sta.storeMaskIn(i) <> stu.io.st_mask_out
+
+  // 4. Store Data (STD) issue from RS
+  // MemBlock.scala:68, 674-677
+  stdExeUnits(i).io.fromInt <> io.ooo_to_mem.issue(i + LduCnt + StuCnt)
+  //   StdExeUnit[0] ← issue(4)
+  //   StdExeUnit[1] ← issue(5)
+
+  // 5. STD writeback to StoreQueue
+  // MemBlock.scala:702
+  lsq.io.std.storeDataIn(i) := stData(i)
+  //   Writes: store data value
+}
+```
+
+**Issue Allocation:**
+
+The issue ports are allocated as follows:
+
+```
+io.ooo_to_mem.issue[] allocation (LsExuCnt = 4, StuCnt = 2):
+┌─────────┬──────────────────────────────────────────┐
+│ Port    │ Target                                   │
+├─────────┼──────────────────────────────────────────┤
+│ [0]     │ LoadUnit[0].io.ldin                     │
+│ [1]     │ LoadUnit[1].io.ldin                     │
+│ [2]     │ StoreUnit[0].io.stin (STA)              │
+│ [3]     │ StoreUnit[1].io.stin (STA)              │
+│ [4]     │ StdExeUnit[0].io.fromInt (STD)          │
+│ [5]     │ StdExeUnit[1].io.fromInt (STD)          │
+└─────────┴──────────────────────────────────────────┘
+```
+
+**StoreQueue Writeback (StoreQueue.scala:296-349):**
+
+```scala
+// Store Address writeback
+for (i <- 0 until StorePipelineWidth) {
+  val stWbIndex = io.storeAddrIn(i).bits.uop.sqIdx.value
+  when (io.storeAddrIn(i).fire) {
+    val addr_valid = !io.storeAddrIn(i).bits.miss
+    addrvalid(stWbIndex) := addr_valid
+
+    // Write physical address
+    paddrModule.io.waddr(i) := stWbIndex
+    paddrModule.io.wdata(i) := io.storeAddrIn(i).bits.paddr
+    paddrModule.io.wmask(i) := io.storeAddrIn(i).bits.mask
+    paddrModule.io.wen(i) := true.B
+
+    // Write virtual address
+    vaddrModule.io.waddr(i) := stWbIndex
+    vaddrModule.io.wdata(i) := io.storeAddrIn(i).bits.vaddr
+    vaddrModule.io.wen(i) := true.B
+
+    // Update uop control info
+    uop(stWbIndex).ctrl := io.storeAddrIn(i).bits.uop.ctrl
+  }
+
+  // Store mmio/atomic info (1 cycle later after PMA/PMP check)
+  val storeAddrInFireReg = RegNext(io.storeAddrIn(i).fire && !io.storeAddrIn(i).bits.miss)
+  val stWbIndexReg = RegNext(stWbIndex)
+  when (storeAddrInFireReg) {
+    pending(stWbIndexReg) := io.storeAddrInRe(i).mmio
+    mmio(stWbIndexReg) := io.storeAddrInRe(i).mmio
+    atomic(stWbIndexReg) := io.storeAddrInRe(i).atomic
+    prefetch(stWbIndexReg) := io.storeAddrInRe(i).miss
+  }
+}
+
+// Store Data writeback (not shown in provided excerpt, similar pattern)
+// Updates: datavalid flag and data in dataModule
+```
+
+**Key Differences: Load vs Store Distribution:**
+
+| Aspect | Load Pipeline | Store Pipeline |
+|--------|--------------|----------------|
+| **Source** | LoadQueueReplay (replay queue) | Reservation Station (direct issue) |
+| **Distribution** | Striped oldest-first (entries 0,2,4,... vs 1,3,5,...) | RS arbiter decides per instruction |
+| **Priority** | 3-level: L2 hint > Higher priority (DM,FF) > Lower priority | RS scheduling policy |
+| **Selection** | Age-based within stripe, program-order for L2 hint | RS ready-oldest or other policy |
+| **Pipeline Stages** | 3-stage (s0: select, s1: register, s2: issue) | Direct (RS → Store Unit) |
+| **Throttling** | Cold-down counter prevents flooding | RS rate limiting |
+| **Replay Mechanism** | Yes (normal replay, fast replay, super replay) | No (stores don't replay from SQ) |
+
+**Conditions for Distribution:**
+
+**Load Replay Conditions:**
+1. **Entry must be allocated**: `allocated(i) === true.B`
+2. **Entry must not be scheduled**: `scheduled(i) === false.B`
+3. **Entry must not be blocking**: `blocking(i) === false.B`
+4. **Cold-down must allow**: `coldCounter < ColdDownThreshold`
+5. **Must pass priority selection**: Selected as oldest in its stripe
+6. **Must not be flushed**: `!uop(i).robIdx.needFlush(redirect)`
+
+**Store Issue Conditions:**
+1. **RS must have ready entry**: Operands ready, no structural hazards
+2. **StoreQueue must have space**: Entry was allocated at dispatch
+3. **TLB port available**: For address translation
+4. **No pipeline hazards**: Store Unit pipeline not stalled
+
+### 3. Load Unit Complete Interface Block Diagram
 
 This diagram shows **ALL** interfaces of a single Load Unit with complete detail.
 Each Load Unit (there are 2: LoadUnit[0] and LoadUnit[1]) has identical interfaces.
@@ -821,7 +1314,7 @@ Each Load Unit (there are 2: LoadUnit[0] and LoadUnit[1]) has identical interfac
 
 This shows the complete microarchitecture of a single Load Unit with all interfaces.
 
-### 3. Store Pipeline Data Flow
+### 4. Store Pipeline Data Flow
 
 ```
 Store Unit [0]              Store Unit [1]
@@ -850,7 +1343,7 @@ Store Unit [0]              Store Unit [1]
          (Store Buffer)
 ```
 
-### 4. Load-Store Forwarding
+### 5. Load-Store Forwarding
 
 ```
 Load Unit [0]                Load Unit [1]
@@ -890,7 +1383,7 @@ Load Unit [0]                Load Unit [1]
      addrInvalid[1]
 ```
 
-### 5. Memory Ordering Violation Detection
+### 6. Memory Ordering Violation Detection
 
 ```
 Load Unit [0/1] (S2)
@@ -928,7 +1421,7 @@ LoadQueueRAR (Read-After-Read violation checker)
       └─► resp (to Load Unit)
 ```
 
-### 6. Commit Path
+### 7. Commit Path
 
 ```
 ROB (Reorder Buffer)

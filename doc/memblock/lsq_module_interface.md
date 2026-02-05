@@ -1104,6 +1104,20 @@ dataReadyPtrExt: SqPtr                  // Oldest data-not-ready store
        sqIdx = storeAddrIn(i).bits.uop.sqIdx
        if (entry.waitSqIdx == sqIdx):
          entry.ready := true
+
+   // RAR queue full resolved (C_RAR)
+   // LoadQueueReplay.scala:331-333
+   when (cause(i)(C_RAR)):
+     // Unblock when RAR queue has space OR load is old enough to skip check
+     blocking(i) := Mux(!io.rarFull || !isAfter(uop(i).lqIdx, io.ldWbPtr),
+                        false.B, blocking(i))
+
+   // RAW queue full resolved (C_RAW)
+   // LoadQueueReplay.scala:335-337
+   when (cause(i)(C_RAW)):
+     // Unblock when RAW queue has space OR store is old enough to skip check
+     blocking(i) := Mux(!io.rawFull || !isAfter(uop(i).sqIdx, io.stAddrReadySqPtr),
+                        false.B, blocking(i))
    ```
 
 3. **Schedule Replay**:
@@ -1134,11 +1148,140 @@ dataReadyPtrExt: SqPtr                  // Oldest data-not-ready store
      entry.ready := true
    ```
 
+5. **Dependency Tracking with blockSqIdx**:
+
+   For C_MA (memory ambiguity) and C_FF (forward fail) causes, the replay queue tracks **which specific store** the load is waiting for using `blockSqIdx`. This enables precise wakeup.
+
+   **Step 1: Violation Detection & sqIdx Capture (Load Unit S2)**
+
+   When a load queries StoreQueue for forwarding, it receives dependency info:
+   ```scala
+   // LoadUnit.scala:933-934 (S2 stage)
+   io.lsq.forward (S1→S2 query)
+     ├─► sqIdx, paddr, vaddr, mask
+     │
+     ├─◄ dataInvalid: Bool           ← Store data not ready
+     ├─◄ addrInvalid: Bool           ← Store address not ready
+     ├─◄ dataInvalidSqIdx: SqPtr     ← **Which store's data is missing**
+     └─◄ addrInvalidSqIdx: SqPtr     ← **Which store's addr is missing**
+
+   // Saved to rep_info for S3
+   s2_out.rep_info.data_inv_sq_idx := io.lsq.forward.dataInvalidSqIdx
+   s2_out.rep_info.addr_inv_sq_idx := io.lsq.forward.addrInvalidSqIdx
+   ```
+
+   **Step 2: Record Dependency in Replay Entry**
+
+   ```scala
+   // LoadQueueReplay.scala:234 (Field)
+   val blockSqIdx = Reg(Vec(LoadQueueReplaySize, new SqPtr))
+
+   // LoadQueueReplay.scala:615-623 (Enqueue)
+   when (needEnqueue(w) && enq.ready) {
+     val replayInfo = enq.bits.rep_info
+
+     // C_MA: Memory Ambiguity - wait for store address
+     when (replayInfo.cause(LoadReplayCauses.C_MA)) {
+       blockSqIdx(enqIndex) := replayInfo.addr_inv_sq_idx
+     }
+
+     // C_FF: Forward Fail - wait for store data
+     when (replayInfo.cause(LoadReplayCauses.C_FF)) {
+       blockSqIdx(enqIndex) := replayInfo.data_inv_sq_idx
+     }
+   }
+   ```
+
+   **Step 3: Resolution Detection (Three Methods)**
+
+   **Method A - Ready Vector Check (registered):**
+   ```scala
+   // StoreQueue provides per-entry ready vectors
+   io.stAddrReadyVec(i) := RegNext(allocated(i) && addrvalid(i))
+   io.stDataReadyVec(i) := RegNext(allocated(i) && datavalid(i))
+
+   // LoadQueueReplay.scala:280-281 - Check specific blocking store
+   dataNotBlockVec(i) := !isBefore(io.stDataReadySqPtr, blockSqIdx(i)) ||
+                         stDataReadyVec(blockSqIdx(i).value) ||  // ← Check THIS store!
+                         io.sqEmpty
+
+   addrNotBlockVec(i) := !isBefore(io.stAddrReadySqPtr, blockSqIdx(i)) ||
+                         stAddrReadyVec(blockSqIdx(i).value) ||  // ← Check THIS store!
+                         io.sqEmpty
+   ```
+
+   **Method B - Same-Cycle Match (zero-cycle wakeup):**
+   ```scala
+   // LoadQueueReplay.scala:284-295 - Detect store executing this cycle
+   storeAddrInSameCycleVec(i) := VecInit((0 until StorePipelineWidth).map(w => {
+     io.storeAddrIn(w).valid &&
+     !io.storeAddrIn(w).bits.miss &&
+     blockSqIdx(i) === io.storeAddrIn(w).bits.uop.sqIdx  // ← Match!
+   })).asUInt.orR
+
+   storeDataInSameCycleVec(i) := VecInit((0 until StorePipelineWidth).map(w => {
+     io.storeDataIn(w).valid &&
+     blockSqIdx(i) === io.storeDataIn(w).bits.uop.sqIdx  // ← Match!
+   })).asUInt.orR
+   ```
+
+   **Method C - Combined Readiness:**
+   ```scala
+   // LoadQueueReplay.scala:298-308
+   stAddrDeqVec(i) := allocated(i) && (addrNotBlockVec(i) | storeAddrInSameCycleVec(i))
+   stDataDeqVec(i) := allocated(i) && (dataNotBlockVec(i) | storeDataInSameCycleVec(i))
+   ```
+
+   **Step 4: Blocking Release**
+   ```scala
+   // LoadQueueReplay.scala:311-325
+   for (i <- 0 until LoadQueueReplaySize) {
+     // C_MA: Wait for store address
+     when (cause(i)(LoadReplayCauses.C_MA)) {
+       blocking(i) := Mux(stAddrDeqVec(i), false.B, blocking(i))
+     }
+
+     // C_FF: Wait for store data
+     when (cause(i)(LoadReplayCauses.C_FF)) {
+       blocking(i) := Mux(stDataDeqVec(i), false.B, blocking(i))
+     }
+   }
+   ```
+
+   **Complete Flow Example:**
+   ```
+   T0: Load S2 queries StoreQueue
+       ├─► dataInvalid=true, dataInvalidSqIdx=SqPtr(15)
+       └─► S3: rep_info.data_inv_sq_idx = SqPtr(15), cause=C_FF
+
+   T1: Load enqueues to LoadQueueReplay entry 8
+       ├─► blockSqIdx(8) := SqPtr(15)  ← Dependency recorded
+       └─► blocking(8) := true
+
+   T2-T5: Waiting (blocking=true)
+       └─► stDataReadyVec(15) = false
+
+   T6: Store #15 executes STD
+       ├─► io.storeDataIn(1).valid = true, sqIdx = SqPtr(15)
+       ├─► storeDataInSameCycleVec(8) = true  ← Match!
+       └─► blocking(8) := false  ← Released!
+
+   T7: Entry 8 becomes ready for selection
+
+   T8: Load replays → Forward succeeds
+   ```
+
+   **Why Track Specific sqIdx?**
+   - Without: Load waits for ALL older stores → massive latency
+   - With blockSqIdx: Load wakes IMMEDIATELY when specific blocker completes
+   - Latency saved: (N-1) × store_completion_cycles
+
 **Key Characteristics**:
 - **Selective Replay**: Only replays when blocking condition is resolved
 - **Priority**: Oldest loads replay first (maintains memory ordering)
 - **Backpressure**: Can stall load pipeline if full
 - **Event-driven**: Wakes on cache refills, TLB updates, store data
+- **Precise Dependency**: Tracks specific blocking sqIdx for C_MA/C_FF causes
 
 ---
 
@@ -1175,11 +1318,11 @@ s0_out.forward_tlDchannel := s0_super_ld_rep_select
 ```
 
 **When Triggered**:
-- Cache miss replay in progress
-- **TileLink D channel refill data is already arriving**
-- Can forward data directly from D channel without waiting
+- Cache miss replay **with D-channel refill data available**
+- TileLink D channel is actively returning the requested cache line
+- `forward_tlDchannel` flag is set in the replay request
 
-**Purpose**: Minimize latency by forwarding refill data immediately from TileLink D channel
+**Purpose**: Minimize latency by forwarding refill data immediately from TileLink D channel (bypass cache write → read)
 
 **Characteristics**:
 - Highest priority - preempts all other sources
@@ -1219,17 +1362,45 @@ val s0_ld_rep_valid = io.replay.valid && !io.replay.bits.forward_tlDchannel && !
 ```
 
 **When Triggered**:
-- **L1 cache miss** (cache line not present)
+- **L1 cache miss** (D-channel refill data **not yet available**)
 - **TLB miss** (translation not in TLB)
 - **Bank conflict** (cache bank busy)
-- **Store-to-load forwarding failed** (partial forwarding)
+- **Store-to-load forwarding failed** (see details below)
 
-**Purpose**: Standard replay mechanism for normal miss conditions
+**Purpose**: Standard replay mechanism when D-channel forwarding is not possible
+
+**Store-to-Load Forwarding Failure Cases**:
+
+Store-to-load forwarding (`fwd_fail`) occurs when a load needs data from an older store, but the forwarding cannot complete. There are two main failure scenarios:
+
+1. **`dataInvalid`** - Address matched but data not ready ([StoreQueue.scala:473-501](../../../src/main/scala/xiangshan/mem/lsqueue/StoreQueue.scala#L473))
+   - Store address is computed and matches load address
+   - Store data is **not yet written** to StoreQueue (store is still in execution)
+   - Load must wait until the store writes its data
+   - Tracked via `dataInvalidSqIdx` to wake up when store data becomes valid
+
+2. **`addrInvalid`** (Memory Disambiguation) - SSID matched but address not ready ([StoreQueue.scala:488-554](../../../src/main/scala/xiangshan/mem/lsqueue/StoreQueue.scala#L488))
+   - Store-Set predictor indicates potential dependency (same SSID)
+   - Store address is **not yet computed**
+   - Load must wait until the store computes its address to verify true dependency
+   - Tracked via `addrInvalidSqIdx` to wake up when store address becomes valid
+
+**Partial Forwarding** ([LoadUnit.scala:888-894](../../../src/main/scala/xiangshan/mem/pipeline/LoadUnit.scala#L888)):
+
+```scala
+s2_full_fwd := ((~s2_fwd_mask.asUInt).asUInt & s2_in.mask) === 0.U && !io.lsq.forward.dataInvalid
+```
+
+- `forwardMask`: Byte-level mask indicating which bytes can be forwarded from SQ/SBuffer
+- `full_fwd`: True only when **all** requested bytes are covered by forwarding
+- If partial (e.g., load requests 4 bytes but only 2 are forwardable):
+  - Remaining bytes must come from DCache
+  - If DCache misses, load must replay and wait for both store data and cache refill
 
 **Characteristics**:
 - From LoadQueueReplay module
 - Oldest ready load replays first
-- Event-driven wake-up (refill, TLB update)
+- Event-driven wake-up (store data valid, store address valid, refill, TLB update)
 
 ---
 

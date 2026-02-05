@@ -84,6 +84,189 @@ graph TB
 
 ## Detailed Component Interactions
 
+### 0. StoreUnit Input Sources
+
+Unlike LoadUnit which has 7 input sources with complex priority, **StoreUnit has only 2 input sources**:
+
+#### Input Source Priority Table
+
+| Priority | Source | Input Port | Trigger Condition |
+|----------|--------|------------|-------------------|
+| **0 (High)** | RS Issue | `io.stin` | `stin.valid` |
+| **1 (Low)** | HW Prefetch | `io.prefetch_req` | `prefetch_req.valid && !stin.valid` |
+
+**Code Reference**: [StoreUnit.scala:61-65](../../../src/main/scala/xiangshan/mem/pipeline/StoreUnit.scala#L61)
+
+```scala
+val s0_iss_valid    = io.stin.valid
+val s0_prf_valid    = io.prefetch_req.valid && io.dcache.req.ready
+val s0_valid        = s0_iss_valid || s0_prf_valid
+val s0_use_flow_rs  = s0_iss_valid                    // RS has highest priority
+val s0_use_flow_prf = !s0_iss_valid && s0_prf_valid   // Prefetch only when RS idle
+```
+
+#### Why No Replay Queue for Store?
+
+Store does not need a replay queue like Load because:
+
+1. **TLB Miss**: Feedback to RS → RS re-issues the store
+2. **Cache Miss**: Store data is buffered in StoreQueue → committed to SBuffer → eventually written to DCache
+3. **No data dependency**: Store doesn't wait for data to "arrive" - it just writes data
+
+Load needs replay because it must **wait for data** (cache refill, store forwarding). Store only needs to **deliver data** which can be buffered.
+
+---
+
+### 0.1 Store Hardware Prefetch (SPB - Store Prefetch Bursts)
+
+**Code Reference**: [StorePrefetchBursts.scala](../../../src/main/scala/xiangshan/mem/sbuffer/StorePrefetchBursts.scala)
+
+Yes, store also has hardware prefetch! It's called **SPB (Store Prefetch Bursts)**.
+
+#### Why Does Store Cache Miss Matter?
+
+One might think: "Store just overwrites data, why does cache miss matter?"
+
+The answer is **write-allocate policy**. XiangShan DCache uses write-allocate, meaning:
+
+**Cache line = 64 bytes, but Store = 1/2/4/8 bytes (partial write)**
+
+```
+Cache Line (64 bytes):
+┌────┬────┬────┬────┬────┬────┬────┬────┐
+│ B0 │ B1 │ B2 │ B3 │ B4 │ B5 │... │B63 │
+└────┴────┴────┴────┴────┴────┴────┴────┘
+         ▲
+         │
+    Store 4 bytes here (SW instruction)
+
+Q: Where do the remaining 60 bytes come from?
+A: Must read from Memory first!
+```
+
+**Store with Cache Miss Flow**:
+
+1. Store wants to write 4 bytes at `0x1000`
+2. Cache line not present (miss)
+3. **Must first fetch entire 64-byte line from L2/Memory** (refill/allocate)
+4. Then overwrite the 4 bytes
+5. Set dirty bit
+
+**Why can't we just write without refill?**
+
+```
+Wrong approach (write without refill):
+┌────┬────┬────┬────┬────┬────┬────┬────┐
+│ ?? │ ?? │ XX │ XX │ ?? │ ?? │... │ ?? │  ← Other bytes are garbage!
+└────┴────┴────┴────┴────┴────┴────┴────┘
+
+Correct approach (refill then write):
+┌────┬────┬────┬────┬────┬────┬────┬────┐
+│ A  │ B  │ XX │ XX │ E  │ F  │... │ Z  │  ← Original values + new values
+└────┴────┴────┴────┴────┴────┴────┴────┘
+```
+
+**Impact on SBuffer**:
+- Store commits from StoreQueue → SBuffer
+- SBuffer tries to write to DCache
+- If cache miss → **must wait for refill** → SBuffer stalls
+- SBuffer full → StoreQueue stalls → ROB stalls → **pipeline stalls**
+
+This is why store prefetch helps: prefetch brings cache line early, so store commit hits in cache.
+
+---
+
+#### What is Store Prefetch?
+
+Store prefetch brings cache lines into L1 DCache **before** the store actually writes, reducing store latency by avoiding cache misses at commit time.
+
+#### How SPB Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Store Prefetch Bursts (SPB)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  SBuffer Enqueue ──► Serializer ──► Pattern Detection ──► Burst │
+│       │                   │               │                 │    │
+│       │                   │               │                 │    │
+│       ▼                   ▼               ▼                 ▼    │
+│  [Store 0]           [FIFO Queue]   [Saturate Counter]  [Prefetch│
+│  [Store 1]            serialize      detect stride       Request]│
+│                       to 1/cycle                                 │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### SPB Algorithm
+
+1. **Observe stores going to SBuffer** (committed stores)
+2. **Track store pattern**:
+   - `store_count`: Number of stores observed
+   - `saturate_counter`: Cumulative cache block address difference
+3. **Burst condition** (after N stores, default N=48):
+   ```scala
+   can_burst = (store_count > N) &&
+               (store_count / 8 == saturate_counter) &&
+               (saturate_counter >= 0)
+   ```
+   - This detects **sequential store pattern** (e.g., memset, memcpy)
+   - If stores are sequential, `saturate_counter ≈ store_count / 8` (8 stores per cache line)
+4. **Issue prefetch requests** to StoreUnit for next cache lines
+
+#### SPB Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ENABLE_SPB` | true | Enable Store Prefetch Bursts |
+| `SPB_N` | 48 | Store count threshold for burst |
+| `BURST_ENGINE_SIZE` | 2 | Number of concurrent burst engines |
+| `ONLY_ON_MEMSET` | false | Only burst on memset pattern |
+
+#### When SPB Triggers
+
+- **memset**: Sequential stores to consecutive addresses → Perfect pattern
+- **memcpy**: Sequential stores during copy → Good pattern
+- **Random stores**: No pattern detected → No prefetch
+
+#### Store Prefetch Flow
+
+```mermaid
+sequenceDiagram
+    participant SQ as Store Queue
+    participant SB as SBuffer
+    participant SPB as SPB
+    participant SU as StoreUnit
+    participant DC as DCache
+
+    SQ->>SB: Commit store to SBuffer
+    SB->>SPB: sbuffer_enq (vaddr)
+
+    SPB->>SPB: Update store_count++
+    SPB->>SPB: Update saturate_counter
+
+    alt Burst Condition Met
+        SPB->>SPB: Detect sequential pattern
+        SPB->>SU: prefetch_req.valid = 1<br>vaddr = next_block_addr
+
+        alt StoreUnit Idle (no RS issue)
+            SU->>DC: Prefetch request
+            DC->>DC: Bring cache line to L1
+        else StoreUnit Busy
+            Note over SU: Prefetch blocked<br>(RS has priority)
+        end
+    end
+```
+
+#### Important Notes
+
+1. **Lower priority than RS**: Prefetch only issues when no store from RS
+2. **Based on committed stores**: Observes SBuffer, not speculative stores
+3. **Page boundary aware**: Won't prefetch across page boundaries
+4. **L1 only**: This is L1 store prefetch (there's also L2 store prefetch via SMS)
+
+---
+
 ### 1. Reservation Station (RS) Interface
 
 #### Input: Store Instruction Issue
