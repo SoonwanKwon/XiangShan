@@ -35,6 +35,59 @@ XiangShan explicitly handles **two types** of memory hazards that require violat
 
 ---
 
+### Practical Execution Model (Speculative Issue + Post-Check)
+
+At a high level, loads are **issued speculatively** once their operands are ready (unless a memory dependence predictor forces a wait). RAW checks are performed **after issue**, when physical address information becomes available:
+
+- **Load-driven check (S1/S2)**: when a load’s `paddr` is known in LoadPipe S1/S2, it **queries/allocates in LoadQueueRAW** (tracking loads that might violate).
+- **Store-driven checks**:
+  - **Store S1**: address-ready broadcast (`s1_nuke`) checks for conflicts early.
+  - **Store S3 (complete)**: CAM search in LoadQueueRAW for final violation detection and redirect.
+
+This means RAW detection is generally **speculate-first, verify-later** rather than a pre-issue gate.
+
+---
+
+## StoreSet (SSIT/LFST) Overview
+
+StoreSet is the **memory dependence predictor** used to decide whether a load should **wait before issue**, even though its `paddr` is not known yet. It works on **PC-based prediction**, not on `paddr`:
+
+### Key Data Structures
+
+- **SSIT (Store Set Identifier Table)**  
+  Indexed by a hashed PC (`foldpc`). Stores `(valid, ssid, strict)` for each PC.
+
+- **LFST (Last Fetched Store Table)**  
+  Maps `ssid → lastStoreRobIdx` so the load can wait for the most recent older store in that set.
+
+### How It Works (High-Level Flow)
+
+1. **Decode**: read SSIT by `foldpc`  
+   - If hit: attach `ssid` / `strict` to the uop.  
+   - If miss: load issues normally (no store-set wait).
+
+2. **Dispatch / Issue**: if `ssid` is valid, query LFST and set `waitForRobIdx`  
+   - The load is **blocked** until the tracked store reaches the required stage.  
+   - This decision is made **before `paddr` is available**, so it can prevent risky speculation.
+
+3. **Violation Update**: on a load–store ordering replay/redirect  
+   - Backend sends `memPredUpdate` with **load PC + store PC**.  
+   - SSIT allocates or merges SSIDs to reduce future violations.  
+   - If violations repeat, `strict` can be set to enforce stronger waiting.
+
+### Why This Matters
+
+- StoreSet controls **pre-issue waiting** based on prediction.  
+- RAW Queue and `s1_nuke` still do **post-issue verification** with `paddr`.  
+- Together they form: **Predict-before-issue + Verify-after-issue**.
+
+Relevant files:
+- `src/main/scala/xiangshan/mem/mdp/StoreSet.scala`
+- `src/main/scala/xiangshan/backend/CtrlBlock.scala`
+- `src/main/scala/xiangshan/backend/dispatch/Dispatch.scala`
+
+---
+
 ## Top-Level Architecture
 
 ```mermaid

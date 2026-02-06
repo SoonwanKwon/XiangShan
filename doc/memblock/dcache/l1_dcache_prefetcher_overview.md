@@ -165,6 +165,11 @@ Priority:
 Assume a loop touches consecutive cache lines in the same region:
 `A[0] -> A[1] -> A[2] -> A[3] ...`
 
+Important clarification:\n
+- The `tag` here is **not** the DCache tag/index.\n
+- It is the **stream prefetcher’s region tag**, derived from **vaddr** by `get_region_tag(vaddr)`.\n
+- Therefore **different load instructions (different PCs) can map to the same region tag** if they access the same address region.\n
+
 Stream table entry (`StreamBitVectorBundle`) evolves as follows:
 
 ```
